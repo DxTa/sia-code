@@ -58,6 +58,7 @@ sia-code status
 | `sia-code research "question"` | Multi-hop relationship discovery |
 | `sia-code memory sync-git` | Import timeline/changelog from git |
 | `sia-code memory search "topic"` | Search stored project memory |
+| `sia-code memory trace "query"` | Trace likely causal timeline events for query |
 | `sia-code config show` | Print active configuration |
 
 ## Search Modes (important)
@@ -86,6 +87,13 @@ How semantic summary generation works:
 
 ```bash
 sia-code memory sync-git
+sia-code memory trace "why did command parsing change" --format table
+sia-code memory add-decision "Keep sqlite-vec default" \
+  -d "Need a stable local-first backend baseline" \
+  -r "Consistent behavior across environments" \
+  --link-file sia_code/config.py \
+  --link-symbol default_backend \
+  --link-timeline "feature/sqlite-vec->main"
 sia-code memory changelog --format markdown
 ```
 

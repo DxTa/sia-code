@@ -1,13 +1,13 @@
 """Integration test for Sia Code CLI."""
 
-import pytest
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-import os
-import shutil
+
+import pytest
 
 
 @pytest.fixture
@@ -269,6 +269,72 @@ class TestCLICompact:
 
         # Should either compact or say not needed
         assert result.returncode == 0
+
+
+class TestCLIMemory:
+    """Test memory subcommands."""
+
+    def test_memory_trace_not_initialized(self, test_project):
+        """memory trace should fail when repo is not initialized."""
+        result = run_cli(["memory", "trace", "hello_world"], cwd=test_project)
+
+        assert result.returncode != 0
+
+    def test_memory_trace_after_init_returns_success(self, test_project):
+        """memory trace should run successfully after init/index."""
+        run_cli(["init"], cwd=test_project)
+        disable_embeddings(test_project)
+        run_cli(["index", "."], cwd=test_project)
+
+        result = run_cli(
+            ["memory", "trace", "hello_world", "--format", "json"],
+            cwd=test_project,
+        )
+
+        assert result.returncode == 0
+        assert '"query": "hello_world"' in result.stdout
+
+    def test_memory_add_decision_with_conceptual_links(self, test_project):
+        """memory add-decision should persist conceptual links."""
+        run_cli(["init"], cwd=test_project)
+        disable_embeddings(test_project)
+        run_cli(["index", "."], cwd=test_project)
+
+        create_result = run_cli(
+            [
+                "memory",
+                "add-decision",
+                "Conceptual memory links",
+                "-d",
+                "Attach rationale to physical code artifacts",
+                "--link-file",
+                "sia_code/cli.py",
+                "--link-symbol",
+                "memory_trace",
+                "--link-timeline",
+                "feature/x->main",
+                "--link-changelog",
+                "v0.7.0",
+            ],
+            cwd=test_project,
+        )
+        assert create_result.returncode == 0
+
+        list_result = run_cli(
+            ["memory", "list", "--type", "decision", "--status", "pending", "--format", "json"],
+            cwd=test_project,
+        )
+        assert list_result.returncode == 0
+
+        payload = json.loads(list_result.stdout)
+        assert payload["decisions"]
+
+        links = payload["decisions"][0]["conceptual_links"]
+        link_pairs = {(item["type"], item["ref"]) for item in links}
+        assert ("file", "sia_code/cli.py") in link_pairs
+        assert ("symbol", "memory_trace") in link_pairs
+        assert ("timeline", "feature/x->main") in link_pairs
+        assert ("changelog", "v0.7.0") in link_pairs
 
 
 if __name__ == "__main__":

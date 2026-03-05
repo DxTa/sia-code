@@ -12,6 +12,7 @@ from usearch.index import Index, MetricKind
 from ..core.models import (
     ChangelogEntry,
     Chunk,
+    CodeRelationshipRecord,
     Decision,
     ImportResult,
     IndexStats,
@@ -167,6 +168,41 @@ class UsearchSqliteBackend(StorageBackend):
                 start = end = 1
 
         return (path_part, start, end)
+
+    @staticmethod
+    def _load_json_list(raw_value: str | None) -> list[dict[str, Any]]:
+        """Decode a JSON list column, defaulting to an empty list."""
+        return json.loads(raw_value) if raw_value else []
+
+    @staticmethod
+    def _render_conceptual_links(conceptual_links: list[dict[str, Any]]) -> str:
+        """Render conceptual links into approved-memory markdown text."""
+        if not conceptual_links:
+            return ""
+
+        rendered = "\n\nConceptual links:\n"
+        for link in conceptual_links:
+            link_type = link.get("type", "artifact")
+            ref = link.get("ref", "")
+            rationale = link.get("rationale")
+            if rationale:
+                rendered += f"- [{link_type}] {ref} ({rationale})\n"
+            else:
+                rendered += f"- [{link_type}] {ref}\n"
+        return rendered
+
+    @staticmethod
+    def _row_to_code_relationship(row: sqlite3.Row) -> CodeRelationshipRecord:
+        """Convert a database row into a code relationship record."""
+        return CodeRelationshipRecord(
+            id=row["id"],
+            from_entity=row["from_entity"],
+            to_entity=row["to_entity"],
+            relationship_type=row["relationship_type"],
+            from_chunk_id=row["from_chunk_id"] or None,
+            to_chunk_id=row["to_chunk_id"] or None,
+            created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+        )
 
     def _get_embedder(self):
         """Lazy-load the embedding model with GPU if available.
@@ -568,6 +604,34 @@ class UsearchSqliteBackend(StorageBackend):
         # Index for file path queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path)")
 
+        # Persisted code relationships for graph-aware research
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS code_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_entity TEXT NOT NULL,
+                to_entity TEXT NOT NULL,
+                relationship_type TEXT NOT NULL,
+                from_chunk_id TEXT NOT NULL DEFAULT '',
+                to_chunk_id TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(from_entity, to_entity, relationship_type, from_chunk_id, to_chunk_id)
+            )
+        """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_code_relationships_from ON code_relationships(from_entity)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_code_relationships_to ON code_relationships(to_entity)"
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_code_relationships_type
+            ON code_relationships(relationship_type)
+        """
+        )
+
         # Timeline events table
         cursor.execute(
             """
@@ -616,6 +680,7 @@ class UsearchSqliteBackend(StorageBackend):
                 description TEXT,
                 reasoning TEXT,
                 alternatives JSON,
+                conceptual_links JSON,
                 status TEXT DEFAULT 'pending',
                 category TEXT,
                 commit_hash TEXT,
@@ -673,6 +738,7 @@ class UsearchSqliteBackend(StorageBackend):
         ensure_column("changelogs", "commit_time", "TIMESTAMP")
         ensure_column("decisions", "commit_hash", "TEXT")
         ensure_column("decisions", "commit_time", "TIMESTAMP")
+        ensure_column("decisions", "conceptual_links", "JSON")
 
         self.conn.commit()
 
@@ -1333,6 +1399,87 @@ class UsearchSqliteBackend(StorageBackend):
         )
 
     # ===================================================================
+    # Code Relationship Graph
+    # ===================================================================
+
+    def add_code_relationships(self, relationships: list[CodeRelationshipRecord]) -> int:
+        """Persist code relationships discovered during research."""
+        if self.conn is None:
+            raise RuntimeError("Index not initialized")
+        if not relationships:
+            return 0
+
+        cursor = self.conn.cursor()
+        before = self.conn.total_changes
+
+        cursor.executemany(
+            """
+            INSERT OR IGNORE INTO code_relationships (
+                from_entity,
+                to_entity,
+                relationship_type,
+                from_chunk_id,
+                to_chunk_id
+            ) VALUES (?, ?, ?, ?, ?)
+        """,
+            [
+                (
+                    rel.from_entity,
+                    rel.to_entity,
+                    rel.relationship_type,
+                    rel.from_chunk_id or "",
+                    rel.to_chunk_id or "",
+                )
+                for rel in relationships
+            ],
+        )
+        self.conn.commit()
+        return self.conn.total_changes - before
+
+    def get_code_relationships(
+        self,
+        from_entity: str | None = None,
+        to_entity: str | None = None,
+        relationship_type: str | None = None,
+        limit: int = 100,
+    ) -> list[CodeRelationshipRecord]:
+        """Query persisted code relationships."""
+        if self.conn is None:
+            raise RuntimeError("Index not initialized")
+
+        cursor = self.conn.cursor()
+
+        conditions = []
+        params: list[Any] = []
+
+        if from_entity:
+            conditions.append("from_entity = ?")
+            params.append(from_entity)
+        if to_entity:
+            conditions.append("to_entity = ?")
+            params.append(to_entity)
+        if relationship_type:
+            conditions.append("relationship_type = ?")
+            params.append(relationship_type)
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+
+        cursor.execute(
+            f"""
+            SELECT id, from_entity, to_entity, relationship_type,
+                   from_chunk_id, to_chunk_id, created_at
+            FROM code_relationships
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ?
+        """,
+            params,
+        )
+
+        return [self._row_to_code_relationship(row) for row in cursor.fetchall()]
+
+    # ===================================================================
     # Decision Management
     # ===================================================================
 
@@ -1343,6 +1490,7 @@ class UsearchSqliteBackend(StorageBackend):
         description: str,
         reasoning: str | None = None,
         alternatives: list[dict[str, Any]] | None = None,
+        conceptual_links: list[dict[str, Any]] | None = None,
         commit_hash: str | None = None,
         commit_time: datetime | None = None,
     ) -> int:
@@ -1370,10 +1518,11 @@ class UsearchSqliteBackend(StorageBackend):
                 description,
                 reasoning,
                 alternatives,
+                conceptual_links,
                 commit_hash,
                 commit_time
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 session_id,
@@ -1381,6 +1530,7 @@ class UsearchSqliteBackend(StorageBackend):
                 description,
                 reasoning,
                 json.dumps(alternatives or []),
+                json.dumps(conceptual_links or []),
                 commit_hash,
                 commit_time.isoformat() if commit_time else None,
             ),
@@ -1418,7 +1568,7 @@ class UsearchSqliteBackend(StorageBackend):
         # Get the decision
         cursor.execute(
             """
-            SELECT title, description, reasoning 
+            SELECT title, description, reasoning, conceptual_links
             FROM decisions 
             WHERE id = ? AND status = 'pending'
         """,
@@ -1440,6 +1590,8 @@ class UsearchSqliteBackend(StorageBackend):
 
         # Add to approved memory
         content = f"{row['description']}\n\nReasoning: {row['reasoning'] or 'N/A'}"
+        conceptual_links = self._load_json_list(row["conceptual_links"])
+        content += self._render_conceptual_links(conceptual_links)
         cursor.execute(
             """
             INSERT INTO approved_memory (decision_id, category, title, content)
@@ -1487,7 +1639,7 @@ class UsearchSqliteBackend(StorageBackend):
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            SELECT id, session_id, title, description, reasoning, alternatives,
+            SELECT id, session_id, title, description, reasoning, alternatives, conceptual_links,
                    status, category, commit_hash, commit_time, created_at, approved_at
             FROM decisions
             WHERE status = 'pending'
@@ -1506,7 +1658,8 @@ class UsearchSqliteBackend(StorageBackend):
                     title=row["title"],
                     description=row["description"],
                     reasoning=row["reasoning"],
-                    alternatives=json.loads(row["alternatives"]) if row["alternatives"] else [],
+                    alternatives=self._load_json_list(row["alternatives"]),
+                    conceptual_links=self._load_json_list(row["conceptual_links"]),
                     status=row["status"],
                     category=row["category"],
                     commit_hash=row["commit_hash"],
@@ -1539,7 +1692,7 @@ class UsearchSqliteBackend(StorageBackend):
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            SELECT id, session_id, title, description, reasoning, alternatives,
+            SELECT id, session_id, title, description, reasoning, alternatives, conceptual_links,
                    status, category, commit_hash, commit_time, created_at, approved_at
             FROM decisions
             WHERE id = ?
@@ -1557,7 +1710,8 @@ class UsearchSqliteBackend(StorageBackend):
             title=row["title"],
             description=row["description"],
             reasoning=row["reasoning"],
-            alternatives=json.loads(row["alternatives"]) if row["alternatives"] else [],
+            alternatives=self._load_json_list(row["alternatives"]),
+            conceptual_links=self._load_json_list(row["conceptual_links"]),
             status=row["status"],
             category=row["category"],
             commit_hash=row["commit_hash"],
@@ -1866,7 +2020,7 @@ class UsearchSqliteBackend(StorageBackend):
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            SELECT id, title, description, category, status
+            SELECT id, title, description, category, status, conceptual_links
             FROM decisions
             WHERE title LIKE ? OR description LIKE ?
             ORDER BY created_at DESC
@@ -1878,6 +2032,7 @@ class UsearchSqliteBackend(StorageBackend):
         # Convert to SearchResults (wrapping in fake chunks for compatibility)
         results = []
         for row in cursor.fetchall():
+            conceptual_links = self._load_json_list(row["conceptual_links"])
             # Create a pseudo-chunk for the decision
             fake_chunk = Chunk(
                 symbol=row["title"],
@@ -1887,7 +2042,13 @@ class UsearchSqliteBackend(StorageBackend):
                 chunk_type=ChunkType.FUNCTION,  # Fake type
                 language=Language.PYTHON,  # Fake language
                 file_path=Path(f"decisions/{row['id']}.md"),
-                metadata={"type": "decision", "status": row["status"], "category": row["category"]},
+                metadata={
+                    "type": "decision",
+                    "status": row["status"],
+                    "category": row["category"],
+                    "conceptual_links": conceptual_links,
+                    "conceptual_link_count": len(conceptual_links),
+                },
             )
             results.append(SearchResult(chunk=fake_chunk, score=1.0))
 
@@ -2039,7 +2200,7 @@ class UsearchSqliteBackend(StorageBackend):
             cursor = self.conn.cursor()
             cursor.execute(
                 """
-                SELECT id, session_id, title, description, reasoning, category, commit_hash, commit_time, approved_at
+                SELECT id, session_id, title, description, reasoning, category, conceptual_links, commit_hash, commit_time, approved_at
                 FROM decisions
                 WHERE status = 'approved'
                 ORDER BY approved_at DESC
@@ -2054,6 +2215,7 @@ class UsearchSqliteBackend(StorageBackend):
                         "description": row["description"],
                         "reasoning": row["reasoning"],
                         "category": row["category"],
+                        "conceptual_links": self._load_json_list(row["conceptual_links"]),
                         "commit_hash": row["commit_hash"],
                         "commit_time": row["commit_time"],
                         "approved_at": row["approved_at"],
@@ -2070,6 +2232,7 @@ class UsearchSqliteBackend(StorageBackend):
                     "title": d.title,
                     "description": d.description,
                     "reasoning": d.reasoning,
+                    "conceptual_links": d.conceptual_links,
                     "created_at": d.created_at.isoformat() if d.created_at else None,
                 }
                 for d in pending
@@ -2181,6 +2344,7 @@ class UsearchSqliteBackend(StorageBackend):
                     title=decision_data["title"],
                     description=decision_data["description"],
                     reasoning=decision_data.get("reasoning"),
+                    conceptual_links=decision_data.get("conceptual_links"),
                     commit_hash=decision_data.get("commit_hash"),
                     commit_time=datetime.fromisoformat(decision_data["commit_time"])
                     if decision_data.get("commit_time")

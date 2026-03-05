@@ -24,7 +24,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 from .datasets.ground_truth_sia_code import (
     get_ground_truth_queries,
@@ -35,10 +35,123 @@ from .retrievers import create_retriever
 from .metrics import recall_at_k, precision_at_k
 
 
+LOOKUP_CATEGORIES = {"lookup"}
+COMPREHENSION_CATEGORIES = {"trace", "architecture", "integration"}
+
+ResultRow = Dict[str, Any]
+MetricSummary = Dict[str, float | int]
+
+
+def _group_results_by_category(results: List[ResultRow]) -> Dict[str, List[ResultRow]]:
+    """Group results by non-empty category."""
+    grouped: Dict[str, List[ResultRow]] = {}
+
+    for result in results:
+        category = result.get("category")
+        if not category:
+            continue
+
+        grouped.setdefault(category, []).append(result)
+
+    return grouped
+
+
+def _compute_metric_gap(lookup: MetricSummary, comprehension: MetricSummary) -> Dict[str, float]:
+    """Compute metric deltas between lookup and comprehension summaries."""
+    return {
+        "recall_gap": lookup["recall"] - comprehension["recall"],
+        "precision_gap": lookup["precision"] - comprehension["precision"],
+        "mrr_gap": lookup["mrr"] - comprehension["mrr"],
+    }
+
+
+def _summarize_results_group(results: List[ResultRow]) -> MetricSummary:
+    """Summarize recall/precision/MRR for a result group."""
+    if not results:
+        return {
+            "recall": 0.0,
+            "precision": 0.0,
+            "mrr": 0.0,
+            "num_queries": 0,
+        }
+
+    count = len(results)
+    return {
+        "recall": sum(r["recall_at_k"] for r in results) / count,
+        "precision": sum(r["precision_at_k"] for r in results) / count,
+        "mrr": sum(r["mrr"] for r in results) / count,
+        "num_queries": count,
+    }
+
+
+def compute_comprehension_gap(detailed_results: List[ResultRow], k: int) -> Dict[str, Any]:
+    """Compute lookup-vs-comprehension performance gap for a given k."""
+    k_results = [result for result in detailed_results if result.get("k") == k]
+    grouped_results = _group_results_by_category(k_results)
+
+    lookup_results: List[ResultRow] = []
+    comprehension_results: List[ResultRow] = []
+
+    for category, category_results in grouped_results.items():
+        if category in LOOKUP_CATEGORIES:
+            lookup_results.extend(category_results)
+        if category in COMPREHENSION_CATEGORIES:
+            comprehension_results.extend(category_results)
+
+    lookup_summary = _summarize_results_group(lookup_results)
+    comprehension_summary = _summarize_results_group(comprehension_results)
+
+    by_category = {
+        category: _summarize_results_group(category_results)
+        for category, category_results in sorted(grouped_results.items())
+    }
+
+    return {
+        "k": k,
+        "lookup": lookup_summary,
+        "comprehension": comprehension_summary,
+        "gap": _compute_metric_gap(lookup_summary, comprehension_summary),
+        "by_category": by_category,
+        "lookup_categories": sorted(LOOKUP_CATEGORIES),
+        "comprehension_categories": sorted(COMPREHENSION_CATEGORIES),
+    }
+
+
+def print_comprehension_gap_report(report: Dict[str, Any]) -> None:
+    """Print human-readable comprehension gap report."""
+    k = report["k"]
+    lookup = report["lookup"]
+    comprehension = report["comprehension"]
+    gap = report["gap"]
+
+    print(f"\n=== Comprehension Gap at k={k} ===")
+    print(
+        "Lookup          "
+        f"(n={lookup['num_queries']}): "
+        f"Recall={lookup['recall']:.3f}, "
+        f"Precision={lookup['precision']:.3f}, "
+        f"MRR={lookup['mrr']:.3f}"
+    )
+    print(
+        "Comprehension   "
+        f"(n={comprehension['num_queries']}): "
+        f"Recall={comprehension['recall']:.3f}, "
+        f"Precision={comprehension['precision']:.3f}, "
+        f"MRR={comprehension['mrr']:.3f}"
+    )
+    print(
+        "Gap (lookup - comprehension): "
+        f"Recall={gap['recall_gap']:+.3f}, "
+        f"Precision={gap['precision_gap']:+.3f}, "
+        f"MRR={gap['mrr_gap']:+.3f}"
+    )
+
+
 def evaluate_retriever_on_query(
     retriever,
     query: GroundTruthQuery,
     k: int = 5,
+    codebase_root: Path | None = None,
 ) -> Dict[str, Any]:
     """Evaluate a retriever on a single ground-truth query.
 
@@ -69,7 +182,7 @@ def evaluate_retriever_on_query(
     # Extract file paths from retrieved chunks
     # Format: "# File: path/to/file.py\n..."
     retrieved_files = []
-    codebase_root = Path("/home/dxta/dev/portable-code-index/pci")  # TODO: Make configurable
+    codebase_root = codebase_root.resolve() if codebase_root else None
 
     for chunk in chunks:
         lines = chunk.split("\n")
@@ -79,7 +192,7 @@ def evaluate_retriever_on_query(
 
                 # Normalize to relative path if absolute
                 filepath_obj = Path(filepath)
-                if filepath_obj.is_absolute():
+                if filepath_obj.is_absolute() and codebase_root is not None:
                     try:
                         filepath = str(filepath_obj.relative_to(codebase_root))
                     except ValueError:
@@ -133,6 +246,7 @@ def run_academic_evaluation(
     codebase_path: Path,
     difficulty: str | None = None,
     category: str | None = None,
+    comprehension_report: bool = False,
 ) -> Dict[str, Any]:
     """Run academic metric evaluation on a tool.
 
@@ -181,7 +295,12 @@ def run_academic_evaluation(
         for i, query in enumerate(queries, 1):
             print(f"  [{i}/{len(queries)}] {query.query_id}: {query.query[:60]}...")
 
-            result = evaluate_retriever_on_query(retriever, query, k=k)
+            result = evaluate_retriever_on_query(
+                retriever,
+                query,
+                k=k,
+                codebase_root=codebase_path,
+            )
             result["k"] = k
             all_results.append(result)
 
@@ -193,6 +312,7 @@ def run_academic_evaluation(
 
     # Aggregate results by k
     aggregated = {}
+    comprehension_gap = {}
     for k in k_values:
         k_results = [r for r in all_results if r["k"] == k]
 
@@ -212,22 +332,27 @@ def run_academic_evaluation(
         print(f"Precision@{k}: {avg_precision:.3f}")
         print(f"MRR: {avg_mrr:.3f}")
 
+        if comprehension_report:
+            report = compute_comprehension_gap(all_results, k)
+            comprehension_gap[f"k{k}"] = report
+            print_comprehension_gap_report(report)
+
     # Save detailed results
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results_file = output_dir / f"{tool_name}_{dataset}_k{'_'.join(map(str, k_values))}.json"
+    payload = {
+        "tool": tool_name,
+        "dataset": dataset,
+        "k_values": k_values,
+        "aggregated": aggregated,
+        "detailed_results": all_results,
+    }
+    if comprehension_report:
+        payload["comprehension_gap"] = comprehension_gap
+
     with open(results_file, "w") as f:
-        json.dump(
-            {
-                "tool": tool_name,
-                "dataset": dataset,
-                "k_values": k_values,
-                "aggregated": aggregated,
-                "detailed_results": all_results,
-            },
-            f,
-            indent=2,
-        )
+        json.dump(payload, f, indent=2)
 
     print(f"\n=== Results saved to {results_file} ===")
 
@@ -241,6 +366,7 @@ def run_comparison(
     output_dir: Path,
     index_path: Path,
     codebase_path: Path,
+    comprehension_report: bool = False,
 ) -> None:
     """Run side-by-side comparison of multiple tools.
 
@@ -263,6 +389,7 @@ def run_comparison(
             output_dir=output_dir,
             index_path=index_path,
             codebase_path=codebase_path,
+            comprehension_report=comprehension_report,
         )
         results[tool_name] = aggregated[f"k{k}"]
 
@@ -355,6 +482,11 @@ def main():
         action="store_true",
         help="Show dataset statistics and exit",
     )
+    parser.add_argument(
+        "--comprehension-report",
+        action="store_true",
+        help="Include lookup-vs-comprehension gap report in output",
+    )
 
     args = parser.parse_args()
 
@@ -389,6 +521,7 @@ def main():
             output_dir=args.output,
             index_path=args.index_path,
             codebase_path=args.codebase_path,
+            comprehension_report=args.comprehension_report,
         )
         return
 
@@ -403,6 +536,7 @@ def main():
             codebase_path=args.codebase_path,
             difficulty=args.difficulty,
             category=args.category,
+            comprehension_report=args.comprehension_report,
         )
         return
 

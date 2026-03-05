@@ -8,6 +8,7 @@ from typing import Any
 from ..core.models import (
     ChangelogEntry,
     Chunk,
+    CodeRelationshipRecord,
     Decision,
     ImportResult,
     IndexStats,
@@ -140,6 +141,43 @@ class StorageBackend(ABC):
         ...
 
     # ===================================================================
+    # Code Relationship Graph
+    # ===================================================================
+
+    @abstractmethod
+    def add_code_relationships(self, relationships: list[CodeRelationshipRecord]) -> int:
+        """Persist code relationships discovered during research.
+
+        Args:
+            relationships: Relationship records to persist
+
+        Returns:
+            Number of newly inserted relationships
+        """
+        ...
+
+    @abstractmethod
+    def get_code_relationships(
+        self,
+        from_entity: str | None = None,
+        to_entity: str | None = None,
+        relationship_type: str | None = None,
+        limit: int = 100,
+    ) -> list[CodeRelationshipRecord]:
+        """Query persisted code relationships.
+
+        Args:
+            from_entity: Optional source entity filter
+            to_entity: Optional target entity filter
+            relationship_type: Optional relationship type filter
+            limit: Maximum results to return
+
+        Returns:
+            Relationship records
+        """
+        ...
+
+    # ===================================================================
     # Decision Management
     # ===================================================================
 
@@ -151,6 +189,7 @@ class StorageBackend(ABC):
         description: str,
         reasoning: str | None = None,
         alternatives: list[dict[str, Any]] | None = None,
+        conceptual_links: list[dict[str, Any]] | None = None,
         commit_hash: str | None = None,
         commit_time: datetime | None = None,
     ) -> int:
@@ -164,6 +203,7 @@ class StorageBackend(ABC):
             description: Full decision context
             reasoning: Why this decision was made
             alternatives: Other options considered
+            conceptual_links: Linked conceptual artifacts (code/timeline/changelog refs)
             commit_hash: Git commit hash at time of decision
             commit_time: Commit timestamp for context
 

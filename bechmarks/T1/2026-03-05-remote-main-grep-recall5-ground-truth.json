@@ -1,0 +1,281 @@
+{
+  "tool": "grep",
+  "dataset": "ground-truth-sia-code",
+  "k_values": [
+    5
+  ],
+  "aggregated": {
+    "k5": {
+      "recall": 0.0,
+      "precision": 0.0,
+      "mrr": 0.0,
+      "num_queries": 15
+    }
+  },
+  "detailed_results": [
+    {
+      "query_id": "gt-lookup-001",
+      "query": "Find the MemvidBackend class implementation",
+      "difficulty": "easy",
+      "category": "lookup",
+      "relevant_files": [
+        "sia_code/storage/backend.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 1,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-lookup-002",
+      "query": "Where is the Chunk dataclass defined?",
+      "difficulty": "easy",
+      "category": "lookup",
+      "relevant_files": [
+        "sia_code/core/models.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 1,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-lookup-003",
+      "query": "Find the CLI entry point for sia-code",
+      "difficulty": "easy",
+      "category": "lookup",
+      "relevant_files": [
+        "sia_code/cli/main.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 1,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-trace-001",
+      "query": "How does the 'research' command work from CLI to execution?",
+      "difficulty": "medium",
+      "category": "trace",
+      "relevant_files": [
+        "sia_code/cli/main.py",
+        "sia_code/commands/research.py",
+        "sia_code/search/multi_hop.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 3,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-trace-002",
+      "query": "Trace the indexing pipeline from file discovery to storage",
+      "difficulty": "medium",
+      "category": "trace",
+      "relevant_files": [
+        "sia_code/commands/index.py",
+        "sia_code/indexing/indexer.py",
+        "sia_code/indexing/chunker.py",
+        "sia_code/storage/backend.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 4,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-trace-003",
+      "query": "How does semantic search work in sia-code?",
+      "difficulty": "medium",
+      "category": "trace",
+      "relevant_files": [
+        "sia_code/storage/backend.py",
+        "sia_code/search/multi_hop.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 2,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-arch-001",
+      "query": "What are all the components involved in multi-hop code research?",
+      "difficulty": "hard",
+      "category": "architecture",
+      "relevant_files": [
+        "sia_code/search/multi_hop.py",
+        "sia_code/indexing/entity_extractor.py",
+        "sia_code/storage/backend.py",
+        "sia_code/search/query_preprocessor.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 4,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-arch-002",
+      "query": "How does sia-code support multiple programming languages?",
+      "difficulty": "hard",
+      "category": "architecture",
+      "relevant_files": [
+        "sia_code/language_support/tree_sitter_manager.py",
+        "sia_code/indexing/chunker.py",
+        "sia_code/core/types.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 3,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-arch-003",
+      "query": "What storage and search capabilities does the backend provide?",
+      "difficulty": "hard",
+      "category": "architecture",
+      "relevant_files": [
+        "sia_code/storage/backend.py",
+        "sia_code/storage/schema.py",
+        "sia_code/core/models.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 3,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-integ-001",
+      "query": "How do tree-sitter parsers integrate with the chunking system?",
+      "difficulty": "hard",
+      "category": "integration",
+      "relevant_files": [
+        "sia_code/language_support/tree_sitter_manager.py",
+        "sia_code/indexing/chunker.py",
+        "sia_code/indexing/entity_extractor.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 3,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-integ-002",
+      "query": "What are the dependencies for entity extraction in multi-hop search?",
+      "difficulty": "hard",
+      "category": "integration",
+      "relevant_files": [
+        "sia_code/search/multi_hop.py",
+        "sia_code/indexing/entity_extractor.py",
+        "sia_code/storage/backend.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 3,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-lookup-004",
+      "query": "Where is the SearchResult model defined?",
+      "difficulty": "easy",
+      "category": "lookup",
+      "relevant_files": [
+        "sia_code/core/models.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 1,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-trace-004",
+      "query": "How does the compact command clean up stale chunks?",
+      "difficulty": "medium",
+      "category": "trace",
+      "relevant_files": [
+        "sia_code/commands/compact.py",
+        "sia_code/storage/backend.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 2,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-arch-004",
+      "query": "What CLI commands are available and how are they registered?",
+      "difficulty": "hard",
+      "category": "architecture",
+      "relevant_files": [
+        "sia_code/cli/main.py",
+        "sia_code/commands/index.py",
+        "sia_code/commands/research.py",
+        "sia_code/commands/search.py",
+        "sia_code/commands/compact.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 5,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    },
+    {
+      "query_id": "gt-integ-003",
+      "query": "How does the file watcher integrate with incremental indexing?",
+      "difficulty": "hard",
+      "category": "integration",
+      "relevant_files": [
+        "sia_code/indexing/file_watcher.py",
+        "sia_code/indexing/indexer.py",
+        "sia_code/storage/backend.py"
+      ],
+      "retrieved_files": [],
+      "recall_at_k": 0.0,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "num_relevant": 3,
+      "num_retrieved_relevant": 0,
+      "k": 5
+    }
+  ]
+}
