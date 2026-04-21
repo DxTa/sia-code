@@ -106,7 +106,12 @@ def _build_conceptual_links(
     return conceptual_links
 
 
-def create_backend(index_path: Path, config: Config, valid_chunks=None):
+def create_backend(
+    index_path: Path,
+    config: Config,
+    valid_chunks=None,
+    suppress_stdout_notices: bool = False,
+):
     """Create storage backend with config-based embedding settings.
 
     Args:
@@ -133,14 +138,15 @@ def create_backend(index_path: Path, config: Config, valid_chunks=None):
         and not backend_explicitly_set
     )
     if is_implicit_sqlite_default_on_legacy_usearch:
-        console.print(
-            "[yellow]Detected legacy usearch index with implicit storage backend.[/yellow] "
-            "Using legacy backend for compatibility."
-        )
-        console.print(
-            "[dim]Set 'storage.backend=sqlite-vec' and run 'sia-code index --clean .' "
-            "to migrate when ready.[/dim]"
-        )
+        if not suppress_stdout_notices:
+            console.print(
+                "[yellow]Detected legacy usearch index with implicit storage backend.[/yellow] "
+                "Using legacy backend for compatibility."
+            )
+            console.print(
+                "[dim]Set 'storage.backend=sqlite-vec' and run 'sia-code index --clean .' "
+                "to migrate when ready.[/dim]"
+            )
         effective_backend = "auto"
 
     if (
@@ -160,11 +166,14 @@ def create_backend(index_path: Path, config: Config, valid_chunks=None):
         sys.exit(1)
 
     if effective_backend == "auto" and detected_backend == "usearch":
-        console.print("[yellow]Detected legacy usearch index.[/yellow] Using it for compatibility.")
-        console.print(
-            "[dim]Set 'storage.backend=usearch' to pin legacy mode, "
-            "or run 'sia-code index --clean .' to migrate to sqlite-vec.[/dim]"
-        )
+        if not suppress_stdout_notices:
+            console.print(
+                "[yellow]Detected legacy usearch index.[/yellow] Using it for compatibility."
+            )
+            console.print(
+                "[dim]Set 'storage.backend=usearch' to pin legacy mode, "
+                "or run 'sia-code index --clean .' to migrate to sqlite-vec.[/dim]"
+            )
 
     # Use configured backend; auto-detection defaults to sqlite-vec for new indexes.
     return factory.create_backend(
@@ -265,6 +274,52 @@ def get_git_commit_context(base_dir: Path) -> tuple[str | None, datetime | None]
     commit_time_raw = time_result.stdout.strip()
     commit_time = datetime.fromisoformat(commit_time_raw) if commit_time_raw else None
     return commit_hash, commit_time
+
+
+def get_git_branch_context(base_dir: Path) -> str:
+    """Return the current branch name, or a stable workspace label."""
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=base_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return base_dir.resolve().name
+
+    branch = branch_result.stdout.strip()
+    if branch and branch != "HEAD":
+        return branch
+    return base_dir.resolve().name
+
+
+def build_working_memory_payload(
+    backend,
+    query: str,
+    agent: str | None,
+    session_id: str | None,
+    base_dir: Path,
+) -> dict[str, object]:
+    """Build a shared working-memory payload for agent handoff."""
+    commit_hash, commit_time = get_git_commit_context(base_dir)
+    context = backend.generate_context(query=query)
+
+    return {
+        "working_memory": {
+            "generated_at": datetime.now().isoformat(),
+            "agent": agent,
+            "session_id": session_id,
+            "query": query,
+            "git": {
+                "branch": get_git_branch_context(base_dir),
+                "commit_hash": commit_hash,
+                "commit_time": commit_time.isoformat() if commit_time else None,
+            },
+            "project_memory": context["project_memory"],
+        }
+    }
 
 
 def resolve_index_dir(project_dir: Path | None = None) -> Path:
@@ -1261,7 +1316,7 @@ def compact(path: str, threshold: float, force: bool):
     console.print(f"  Status: {summary.status}\n")
 
     # Load backend
-    backend = create_backend(sia_dir, config)
+    backend = create_backend(sia_dir, config, suppress_stdout_notices=True)
     backend.open_index(writable=True)
 
     coordinator = IndexingCoordinator(config, backend)
@@ -1844,6 +1899,46 @@ def memory_search(query, search_type, limit):
     except Exception as e:
         console.print(f"[red]Error searching memory: {e}[/red]")
         sys.exit(1)
+
+
+@memory.command(name="working-set")
+@click.argument("query")
+@click.option("--agent", type=str, help="Agent name using this shared working-memory payload")
+@click.option("--session-id", type=str, help="Session identifier for multi-step agent work")
+@click.option("-o", "--output", type=click.Path(), help="Write JSON payload to file")
+def memory_working_set(query, agent, session_id, output):
+    """Build a shared working-memory JSON payload for agents.
+
+    Example: sia-code memory working-set "auth flow" --agent planner --session-id ses-123
+    """
+    import json
+
+    sia_dir, config = require_initialized()
+    backend = create_backend(sia_dir, config, suppress_stdout_notices=True)
+    backend.open_index()
+
+    try:
+        payload = build_working_memory_payload(
+            backend=backend,
+            query=query,
+            agent=agent,
+            session_id=session_id,
+            base_dir=Path("."),
+        )
+
+        if output:
+            output_path = Path(output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(payload, indent=2))
+            console.print(f"[green]✓[/green] Working memory written to {output_path}")
+        else:
+            sys.stdout.write(json.dumps(payload, indent=2))
+            sys.stdout.write("\n")
+    except Exception as e:
+        console.print(f"[red]Error building working memory: {e}[/red]")
+        sys.exit(1)
+    finally:
+        backend.close()
 
 
 @memory.command(name="trace")

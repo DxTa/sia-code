@@ -38,6 +38,17 @@ sia-code memory trace "why did auth behavior change" --format table
 
 Use this when you need timeline-aware clues (likely commits/merges) connected to query-relevant files and symbols.
 
+## Shared Working Memory
+
+```bash
+sia-code memory working-set "auth flow" \
+  --agent planner \
+  --session-id ses-123 \
+  --output shared-working-memory.json
+```
+
+Use this when multiple agents or long-running steps need the same query-scoped repo context in a stable JSON payload.
+
 ## Conceptual Decision Links
 
 ```bash

@@ -2168,6 +2168,28 @@ class SqliteVecBackend(StorageBackend):
                 for d in decisions
             ]
 
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, title, description, category, approved_at
+                FROM decisions
+                WHERE status = 'approved'
+                ORDER BY approved_at DESC
+                LIMIT 10
+                """
+            )
+            context["project_memory"]["approved_decisions"] = [
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "description": row["description"],
+                    "status": "approved",
+                    "category": row["category"],
+                    "approved_at": row["approved_at"],
+                }
+                for row in cursor.fetchall()
+            ]
+
         # Recent timeline events
         if include_timeline:
             timeline = self.get_timeline_events(limit=10)

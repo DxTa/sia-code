@@ -34,6 +34,7 @@ sia-code status
 | `memory approve ID` | Approve decision | `-c/--category` (required) |
 | `memory reject ID` | Reject decision | none |
 | `memory search QUERY` | Search memory | `--type`, `-k/--limit` |
+| `memory working-set QUERY` | Build shared working-memory JSON for agent handoff | `--agent`, `--session-id`, `-o/--output` |
 | `memory trace QUERY` | Trace likely causal timeline events for a code query (graph + timeline overlap) | `--hops`, `--seed-limit`, `--timeline-limit`, `-k/--limit`, `--format` |
 | `memory timeline` | View timeline events | `--since`, `--event-type`, `--importance`, `--format` |
 | `memory changelog [RANGE]` | Generate changelog | `--format`, `--output` |

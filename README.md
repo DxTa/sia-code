@@ -58,6 +58,7 @@ sia-code status
 | `sia-code research "question"` | Multi-hop relationship discovery |
 | `sia-code memory sync-git` | Import timeline/changelog from git |
 | `sia-code memory search "topic"` | Search stored project memory |
+| `sia-code memory working-set "query"` | Build shared working-memory JSON for agents |
 | `sia-code memory trace "query"` | Trace likely causal timeline events for query |
 | `sia-code config show` | Print active configuration |
 
@@ -87,6 +88,7 @@ How semantic summary generation works:
 
 ```bash
 sia-code memory sync-git
+sia-code memory working-set "auth flow" --agent planner --session-id ses-123
 sia-code memory trace "why did command parsing change" --format table
 sia-code memory add-decision "Keep sqlite-vec default" \
   -d "Need a stable local-first backend baseline" \
