@@ -3,12 +3,12 @@ name: sia-code
 description: Compact local-first code search skill for CLI agents using BM25, optional semantic search, multi-hop research, and project memory.
 license: MIT
 compatibility: opencode
-version: 0.7.0
+version: 0.7.1
 ---
 
 # Sia-Code Skill (Compact)
 
-Use this skill when an agent needs to explore a codebase quickly, trace architecture, or store/retrieve project decisions.
+Use this skill when an agent needs to explore a codebase quickly, trace architecture, or store/retrieve project decisions and shared working-memory context.
 
 This is a compact, repo-local variant intended for easy copy/paste into LLM CLI skill directories.
 
@@ -67,7 +67,15 @@ uvx sia-code memory approve 1 --category architecture
 
 # recall context
 uvx sia-code memory search "backend default" --type all
+
+# hand off query-scoped working memory to another agent step
+uvx sia-code memory working-set "auth flow" \
+  --agent planner \
+  --session-id ses-123 \
+  -o shared-memory.json
 ```
+
+- `memory working-set` emits stable JSON for agent handoff and includes approved decisions as well as the pending decision queue.
 
 ## Agent-Friendly Session Pattern
 

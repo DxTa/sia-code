@@ -186,8 +186,9 @@ class SummarizationConfig(BaseModel):
 class StorageConfig(BaseModel):
     """Storage backend selection configuration."""
 
-    # auto: pick usearch for legacy indexes (vectors.usearch exists), sqlite-vec otherwise
-    backend: Literal["auto", "sqlite-vec", "usearch"] = "auto"
+    # sqlite-vec is the default for new indexes.
+    # auto remains available for compatibility with legacy usearch indexes.
+    backend: Literal["auto", "sqlite-vec", "usearch"] = "sqlite-vec"
 
 
 class Config(BaseModel):
