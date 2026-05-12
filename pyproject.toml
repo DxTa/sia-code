@@ -60,10 +60,14 @@ Repository = "https://github.com/DxTa/sia-code"
 Issues = "https://github.com/DxTa/sia-code/issues"
 
 [project.optional-dependencies]
-openai = ["openai>=1.0"]
+mcp = [
+    "mcp>=1.12.4",
+    "filelock>=3.16.1",
+]
 pdf = ["pypdf>=3.0"]
 all = [
-    "openai>=1.0",
+    "mcp>=1.12.4",
+    "filelock>=3.16.1",
     "pypdf>=3.0",
 ]
 dev = [
@@ -77,10 +81,13 @@ dev = [
     "bump-my-version>=0.20",
     "anthropic>=0.30",
     "google-generativeai>=0.5",
+    "mcp>=1.12.4",
+    "filelock>=3.16.1",
 ]
 
 [project.scripts]
 sia-code = "sia_code.cli:main"
+sia-code-mcp = "sia_code.mcp:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

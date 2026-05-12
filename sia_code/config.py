@@ -69,9 +69,9 @@ class EmbeddingConfig(BaseModel):
     """
 
     enabled: bool = True
-    provider: str = "huggingface"  # Deprecated - provider auto-detected from model name
+    provider: str = "huggingface"  # Deprecated legacy field; ignored by local-only runtime
     model: str = "BAAI/bge-base-en-v1.5"  # Model name (see supported models above)
-    api_key_env: str = ""  # Environment variable for API key (not needed for local models)
+    api_key_env: str = ""  # Deprecated legacy field; ignored by local-only runtime
     dimensions: int = 768  # Embedding dimensions (auto-detected for most models)
 
 

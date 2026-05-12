@@ -492,9 +492,10 @@ class UsearchSqliteBackend(StorageBackend):
         # Open SQLite database (check_same_thread=False for parallel search)
         self.conn = connect_sqlite(self.db_path, check_same_thread=False)
 
-        # Ensure schema migrations are applied before any writes
-        if writable:
-            self._create_tables()
+        # Ensure schema migrations are applied for legacy indexes even on read-only opens.
+        # This keeps research/status paths from failing on older databases that predate
+        # newer tables like code_relationships.
+        self._create_tables()
 
     def close(self) -> None:
         """Close the index and save changes."""
