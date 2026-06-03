@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import sqlite3
 
-from sia_code.core.models import Chunk
+from sia_code.core.models import Chunk, CodeRelationshipRecord
 from sia_code.core.types import ChunkType, FilePath, Language, LineNumber
 from sia_code.storage.sqlite_vec_backend import SqliteVecBackend
 
@@ -207,6 +207,64 @@ def test_add_decision_stores_commit_context(backend):
     assert decision is not None
     assert decision.commit_hash == "aaa111"
     assert decision.commit_time == commit_time
+
+
+def test_add_decision_stores_conceptual_links(backend):
+    links = [
+        {"type": "file", "ref": "sia_code/cli.py", "rationale": "CLI entry point"},
+        {"type": "symbol", "ref": "memory_trace"},
+    ]
+
+    decision_id = backend.add_decision(
+        session_id="sess-links",
+        title="Trace conceptual reasoning",
+        description="Link intent to code artifacts",
+        reasoning="Need better comprehension",
+        conceptual_links=links,
+    )
+
+    decision = backend.get_decision(decision_id)
+    assert decision is not None
+    assert decision.conceptual_links == links
+
+    memory_results = backend.search_memory("conceptual", k=3)
+    assert memory_results
+    metadata = memory_results[0].chunk.metadata
+    assert metadata["conceptual_link_count"] == 2
+    assert metadata["conceptual_links"] == links
+
+
+def test_code_relationship_persistence(backend):
+    """Store and query persisted code relationships."""
+    relationships = [
+        CodeRelationshipRecord(
+            from_entity="main",
+            to_entity="load_config",
+            relationship_type="function_call",
+            from_chunk_id="1",
+            to_chunk_id="2",
+        ),
+        CodeRelationshipRecord(
+            from_entity="main",
+            to_entity="process_data",
+            relationship_type="function_call",
+            from_chunk_id="1",
+            to_chunk_id="3",
+        ),
+    ]
+
+    inserted = backend.add_code_relationships(relationships)
+    assert inserted == 2
+
+    duplicate_inserted = backend.add_code_relationships(relationships)
+    assert duplicate_inserted == 0
+
+    outgoing = backend.get_code_relationships(from_entity="main", limit=10)
+    assert len(outgoing) == 2
+    assert {rel.to_entity for rel in outgoing} == {"load_config", "process_data"}
+
+    call_edges = backend.get_code_relationships(relationship_type="function_call", limit=10)
+    assert len(call_edges) == 2
 
 
 def test_export_import_memory_preserves_commit_context(tmp_path):

@@ -8,7 +8,7 @@ import sqlite3
 import numpy as np
 import pytest
 
-from sia_code.core.models import Chunk
+from sia_code.core.models import Chunk, CodeRelationshipRecord
 from sia_code.core.types import ChunkType, Language
 from sia_code.storage.usearch_backend import UsearchSqliteBackend
 
@@ -167,6 +167,30 @@ def test_decision_workflow(backend):
     assert decision.category == "architecture"
 
 
+def test_decision_stores_conceptual_links(backend):
+    links = [
+        {"type": "file", "ref": "sia_code/cli.py", "rationale": "CLI entry point"},
+        {"type": "symbol", "ref": "memory_trace"},
+    ]
+
+    decision_id = backend.add_decision(
+        session_id="test-session-links",
+        title="Conceptual links for comprehension",
+        description="Track rationale and intent against code artifacts",
+        conceptual_links=links,
+    )
+
+    decision = backend.get_decision(decision_id)
+    assert decision is not None
+    assert decision.conceptual_links == links
+
+    memory_results = backend.search_memory("comprehension", k=3)
+    assert memory_results
+    metadata = memory_results[0].chunk.metadata
+    assert metadata["conceptual_link_count"] == 2
+    assert metadata["conceptual_links"] == links
+
+
 def test_decision_fifo(backend):
     """Test that FIFO works when >100 pending decisions."""
     # Add 101 pending decisions
@@ -206,6 +230,40 @@ def test_timeline_events(backend):
     assert len(events) > 0
     assert events[0].from_ref == "v1.0.0"
     assert events[0].to_ref == "v1.1.0"
+
+
+def test_code_relationship_persistence(backend):
+    """Test storing and querying persisted code relationships."""
+    relationships = [
+        CodeRelationshipRecord(
+            from_entity="main",
+            to_entity="load_config",
+            relationship_type="function_call",
+            from_chunk_id="1",
+            to_chunk_id="2",
+        ),
+        CodeRelationshipRecord(
+            from_entity="main",
+            to_entity="process_data",
+            relationship_type="function_call",
+            from_chunk_id="1",
+            to_chunk_id="3",
+        ),
+    ]
+
+    inserted = backend.add_code_relationships(relationships)
+    assert inserted == 2
+
+    # Duplicate inserts should be ignored.
+    duplicate_inserted = backend.add_code_relationships(relationships)
+    assert duplicate_inserted == 0
+
+    outgoing = backend.get_code_relationships(from_entity="main", limit=10)
+    assert len(outgoing) == 2
+    assert {rel.to_entity for rel in outgoing} == {"load_config", "process_data"}
+
+    call_edges = backend.get_code_relationships(relationship_type="function_call", limit=10)
+    assert len(call_edges) == 2
 
 
 def test_export_import_memory(backend, temp_index_dir):

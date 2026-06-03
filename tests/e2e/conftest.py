@@ -39,6 +39,42 @@ def e2e_symbol():
     return os.environ.get("E2E_SYMBOL", "main")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def embed_daemon_for_e2e():
+    """Start embedding daemon once for E2E search latency stability."""
+    started_here = False
+
+    status = subprocess.run(
+        ["sia-code", "embed", "status"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    running = status.returncode == 0 and "is running" in status.stdout.lower()
+
+    if not running:
+        start = subprocess.run(
+            ["sia-code", "embed", "start"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+        if start.returncode != 0:
+            pytest.fail("Failed to start embedding daemon")
+        started_here = True
+
+    yield
+
+    if started_here:
+        subprocess.run(
+            ["sia-code", "embed", "stop"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+
+
 @pytest.fixture(scope="session")
 def target_repo(tmp_path_factory, e2e_repo_url, e2e_sparse_paths):
     """Clone target repository for testing.
@@ -102,6 +138,11 @@ def target_repo(tmp_path_factory, e2e_repo_url, e2e_sparse_paths):
 @pytest.fixture(scope="session")
 def initialized_repo(target_repo):
     """Initialize sia-code in the target repository."""
+    # Always reset index state so fixture behavior is deterministic.
+    sia_dir = target_repo / ".sia-code"
+    if sia_dir.exists():
+        shutil.rmtree(sia_dir, ignore_errors=True)
+
     result = subprocess.run(
         ["sia-code", "init"],
         cwd=target_repo,
@@ -114,7 +155,6 @@ def initialized_repo(target_repo):
         pytest.fail(f"Failed to initialize sia-code: {result.stderr}")
 
     # Verify initialization
-    sia_dir = target_repo / ".sia-code"
     assert sia_dir.exists(), ".sia-code directory not created"
     assert (sia_dir / "config.json").exists(), "config.json not created"
     assert (sia_dir / "index.db").exists(), "index.db not created"
@@ -126,6 +166,8 @@ def initialized_repo(target_repo):
         ci_config = json.load(f)
     ci_config["embedding"]["model"] = "BAAI/bge-small-en-v1.5"
     ci_config["embedding"]["dimensions"] = 384
+    ci_config.setdefault("storage", {})
+    ci_config["storage"]["backend"] = "sqlite-vec"
     with open(config_path, "w") as f:
         json.dump(ci_config, f, indent=2)
 
@@ -142,12 +184,6 @@ def indexed_repo(initialized_repo):
     Uses --clean to recreate index with CI-optimized dimensions (384d bge-small)
     after initialized_repo modifies the config from default (768d bge-base).
     """
-    # Check if index already has content (skip re-indexing if it does)
-    index_path = initialized_repo / ".sia-code" / "index.db"
-    if index_path.exists() and index_path.stat().st_size > 100000:  # >100KB means indexed
-        # Index exists and has content, skip re-indexing
-        return initialized_repo
-
     result = subprocess.run(
         ["sia-code", "index", "--clean", "."],
         cwd=initialized_repo,

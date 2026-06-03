@@ -23,6 +23,9 @@ sia-code memory approve 1 --category architecture
 
 # search memory later
 sia-code memory search "Adopt X" --type decision
+
+# build shared working memory for another agent step
+sia-code memory working-set "auth flow" --agent planner --session-id ses-123 -o shared-memory.json
 ```
 
 ## Why `sync-git` matters
@@ -65,6 +68,7 @@ Notes:
 | `memory add-decision` | create pending decision |
 | `memory approve` / `memory reject` | decision workflow |
 | `memory list` | list decisions/timeline/changelogs |
+| `memory working-set` | emit query-scoped shared working-memory JSON for agents, including approved decisions |
 | `memory timeline` | view timeline with filters |
 | `memory changelog` | render changelog text/json/markdown |
 | `memory export` / `memory import` | backup/restore memory data |

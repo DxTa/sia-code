@@ -249,7 +249,7 @@ class TestConfigLoadAndSave:
         config = Config()
 
         assert config.indexing is not None
-        assert config.storage.backend == "auto"
+        assert config.storage.backend == "sqlite-vec"
         assert isinstance(config.indexing.exclude_patterns, list)
 
     def test_config_roundtrip(self, temp_repo):

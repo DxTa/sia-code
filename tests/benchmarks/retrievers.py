@@ -8,7 +8,7 @@ and future integrations (ChunkHound, etc.).
 import re
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Protocol
+from typing import Any, List, Optional, Protocol
 
 from .tasks.architectural_tasks import ArchitecturalTask
 
@@ -44,21 +44,37 @@ class SiaCodeRetriever:
         self.max_hops = max_hops
         self.max_results_per_hop = max_results_per_hop
         self._backend = None
-        self._searcher = None
+        self._searcher: Any | None = None
+
+    def _resolve_index_dir(self) -> Path:
+        """Normalize benchmark index path to .sia-code directory."""
+        if self.index_path.is_dir():
+            return self.index_path
+        if self.index_path.name == "index.db":
+            return self.index_path.parent
+        return self.index_path
 
     def _ensure_initialized(self) -> None:
         """Lazy initialize backend and searcher."""
         if self._backend is not None:
             return
 
-        from sia_code.storage.usearch_backend import UsearchSqliteBackend
+        from sia_code.config import Config
+        from sia_code.storage import factory
         from sia_code.search.multi_hop import MultiHopSearchStrategy
 
-        # Open existing index
-        self._backend = UsearchSqliteBackend(
-            path=self.index_path,
-            embedding_enabled=True,
-            embedding_model="BAAI/bge-base-en-v1.5",
+        index_dir = self._resolve_index_dir()
+        config_path = index_dir / "config.json"
+        config = Config.load(config_path) if config_path.exists() else Config()
+
+        # Open existing index using auto-detection (sqlite-vec by default,
+        # usearch only for legacy indexes still carrying vectors.usearch).
+        self._backend = factory.create_backend(
+            path=index_dir,
+            backend_type="auto",
+            embedding_enabled=config.embedding.enabled,
+            embedding_model=config.embedding.model,
+            ndim=config.embedding.dimensions,
         )
         self._backend.open_index()
 
@@ -76,9 +92,12 @@ class SiaCodeRetriever:
             List of code chunks with file paths and line numbers
         """
         self._ensure_initialized()
+        searcher = self._searcher
+        if searcher is None:
+            raise RuntimeError("Retriever searcher failed to initialize")
 
         # Perform multi-hop research
-        result = self._searcher.research(
+        result = searcher.research(
             question=task.question,
             max_results_per_hop=self.max_results_per_hop,
             max_total_chunks=top_k * 2,  # Allow some buffer for deduplication

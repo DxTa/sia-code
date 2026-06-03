@@ -141,6 +141,31 @@ class SearchResult:
 
 
 @dataclass
+class CodeRelationshipRecord:
+    """Persisted relationship between two code entities."""
+
+    from_entity: str
+    to_entity: str
+    relationship_type: str
+    from_chunk_id: str | None = None
+    to_chunk_id: str | None = None
+    id: int | None = None
+    created_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert relationship record to dictionary form."""
+        return {
+            "id": self.id,
+            "from_entity": self.from_entity,
+            "to_entity": self.to_entity,
+            "relationship_type": self.relationship_type,
+            "from_chunk_id": self.from_chunk_id,
+            "to_chunk_id": self.to_chunk_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+@dataclass
 class IndexStats:
     """Statistics about the code index."""
 
@@ -164,6 +189,7 @@ class Decision:
     description: str
     reasoning: str | None = None
     alternatives: list[dict[str, Any]] = field(default_factory=list)
+    conceptual_links: list[dict[str, Any]] = field(default_factory=list)
     status: str = "pending"  # 'pending', 'approved', 'rejected'
     category: str | None = None  # Set when approved
     commit_hash: str | None = None
@@ -180,6 +206,7 @@ class Decision:
             "description": self.description,
             "reasoning": self.reasoning,
             "alternatives": self.alternatives,
+            "conceptual_links": self.conceptual_links,
             "status": self.status,
             "category": self.category,
             "commit_hash": self.commit_hash,

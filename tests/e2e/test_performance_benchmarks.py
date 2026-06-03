@@ -56,6 +56,7 @@ class TestPerformanceBenchmarks(BaseE2ETest):
         print(f"Max:     {max(latencies) * 1000:.0f}ms" if latencies else "N/A")
         print()
 
+        assert len(latencies) > 0, "Expected at least one successful search latency sample"
         # Relaxed thresholds for CI/local environments
         assert p50 < 5.0, f"P50 latency {p50:.2f}s exceeds 5s target"
         assert p95 < 10.0, f"P95 latency {p95:.2f}s exceeds 10s target"

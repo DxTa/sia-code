@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Set
 
-from ..core.models import Chunk
+from ..core.models import Chunk, CodeRelationshipRecord
 from ..core.types import ChunkId
 from ..storage.base import StorageBackend
 from .entity_extractor import EntityExtractor, Entity
@@ -79,6 +79,75 @@ class MultiHopSearchStrategy:
             logger.debug(f"Preprocessing returned empty for query: {question[:100]}")
         return self.backend.search_lexical(search_query, k=k)
 
+    def _expand_from_persisted_graph(
+        self,
+        seed_chunks: list[Chunk],
+        visited_chunks: Set[ChunkId],
+        max_results_per_hop: int,
+        max_total_chunks: int,
+    ) -> tuple[list[Chunk], list[CodeRelationship]]:
+        """Expand initial results using persisted relationship edges."""
+        discovered_chunks: list[Chunk] = []
+        graph_relationships: list[CodeRelationship] = []
+
+        for source_chunk in seed_chunks[:max_results_per_hop]:
+            if len(visited_chunks) >= max_total_chunks:
+                break
+
+            persisted_edges = self.backend.get_code_relationships(
+                from_entity=source_chunk.symbol,
+                limit=max_results_per_hop,
+            )
+
+            for edge in persisted_edges:
+                if len(visited_chunks) >= max_total_chunks:
+                    break
+
+                try:
+                    target_results = self.backend.search_lexical(edge.to_entity, k=1)
+                except Exception as exc:
+                    logger.debug(f"Persisted graph lookup failed for {edge.to_entity}: {exc}")
+                    continue
+
+                for target_result in target_results:
+                    target_chunk = target_result.chunk
+
+                    if target_chunk.id and target_chunk.id in visited_chunks:
+                        continue
+
+                    discovered_chunks.append(target_chunk)
+                    if target_chunk.id:
+                        visited_chunks.add(target_chunk.id)
+
+                    graph_relationships.append(
+                        CodeRelationship(
+                            from_entity=source_chunk.symbol,
+                            to_entity=target_chunk.symbol,
+                            relationship_type=edge.relationship_type,
+                            from_chunk=source_chunk.id,
+                            to_chunk=target_chunk.id,
+                        )
+                    )
+
+        return discovered_chunks, graph_relationships
+
+    def _persist_relationships(self, relationships: list[CodeRelationship]) -> None:
+        """Persist discovered relationships to storage."""
+        if not relationships:
+            return
+
+        relationship_records = [
+            CodeRelationshipRecord(
+                from_entity=rel.from_entity,
+                to_entity=rel.to_entity,
+                relationship_type=rel.relationship_type,
+                from_chunk_id=str(rel.from_chunk) if rel.from_chunk else None,
+                to_chunk_id=str(rel.to_chunk) if rel.to_chunk else None,
+            )
+            for rel in relationships
+        ]
+        self.backend.add_code_relationships(relationship_records)
+
     def research(
         self, question: str, max_results_per_hop: int = 5, max_total_chunks: int = 50
     ) -> ResearchResult:
@@ -116,6 +185,16 @@ class MultiHopSearchStrategy:
             if chunk.id:
                 visited_chunks.add(chunk.id)
 
+        # Expand from persisted graph relationships before entity-based hops.
+        graph_chunks, graph_relationships = self._expand_from_persisted_graph(
+            seed_chunks=all_chunks,
+            visited_chunks=visited_chunks,
+            max_results_per_hop=max_results_per_hop,
+            max_total_chunks=max_total_chunks,
+        )
+        all_chunks.extend(graph_chunks)
+        relationships.extend(graph_relationships)
+
         # Multi-hop exploration
         current_hop = 0
         entities_to_explore: list[tuple[Entity, Chunk]] = []
@@ -142,12 +221,7 @@ class MultiHopSearchStrategy:
                 try:
                     entity_results = self.backend.search_lexical(entity.name, k=3)
                 except Exception as e:
-                    # Log search failures for debugging
-                    import logging
-
-                    logging.getLogger(__name__).debug(
-                        f"Entity search failed for {entity.name}: {e}"
-                    )
+                    logger.debug(f"Entity search failed for {entity.name}: {e}")
                     continue
 
                 # Process results
@@ -184,6 +258,8 @@ class MultiHopSearchStrategy:
 
             # Prepare for next hop
             entities_to_explore = next_entities
+
+        self._persist_relationships(relationships)
 
         return ResearchResult(
             question=question,

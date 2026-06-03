@@ -62,3 +62,7 @@ dist/
 # Documentation / generated artifacts
 results/
 plans/
+docs/references
+docs/t1
+.claude
+.pci

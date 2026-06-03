@@ -1,9 +1,10 @@
 """Unit tests for multi-hop code research functionality."""
 
 import pytest
-from sia_code.core.models import Chunk
+from sia_code.core.models import Chunk, SearchResult, CodeRelationshipRecord
 from sia_code.core.types import ChunkType, Language, FilePath, LineNumber, ChunkId
 from sia_code.search.multi_hop import MultiHopSearchStrategy, CodeRelationship
+from sia_code.search.entity_extractor import Entity
 from sia_code.storage.usearch_backend import UsearchSqliteBackend
 
 
@@ -181,6 +182,121 @@ class TestMultiHopResearch:
         # Should track entities (even if 0 due to extraction limitations)
         assert result.total_entities_found >= 0
         assert isinstance(result.total_entities_found, int)
+
+    def test_research_persists_relationships(self, backend):
+        """Research should persist discovered relationships into storage."""
+        source_chunk = Chunk(
+            id=ChunkId("source-1"),
+            symbol="source_handler",
+            start_line=LineNumber(1),
+            end_line=LineNumber(3),
+            code="def source_handler():\n    return helper()",
+            chunk_type=ChunkType.FUNCTION,
+            language=Language.PYTHON,
+            file_path=FilePath("app/source.py"),
+        )
+        target_chunk = Chunk(
+            id=ChunkId("target-1"),
+            symbol="helper",
+            start_line=LineNumber(1),
+            end_line=LineNumber(2),
+            code="def helper():\n    return 1",
+            chunk_type=ChunkType.FUNCTION,
+            language=Language.PYTHON,
+            file_path=FilePath("app/helper.py"),
+        )
+
+        strategy = MultiHopSearchStrategy(backend, max_hops=1)
+
+        def mock_initial_search(question, k):
+            return [SearchResult(chunk=source_chunk, score=1.0)]
+
+        def mock_extract_from_chunk(chunk):
+            if chunk.symbol != "source_handler":
+                return []
+            return [
+                Entity(
+                    name="helper",
+                    entity_type="function_call",
+                    source_chunk=chunk.id,
+                )
+            ]
+
+        def mock_search_lexical(query, k=3, include_deps=True, tier_boost=None):
+            if query != "helper":
+                return []
+            return [SearchResult(chunk=target_chunk, score=1.0)]
+
+        strategy._initial_search = mock_initial_search
+        strategy.extractor.extract_from_chunk = mock_extract_from_chunk
+        backend.search_lexical = mock_search_lexical
+
+        result = strategy.research("trace source handler", max_results_per_hop=5)
+
+        assert len(result.relationships) == 1
+
+        persisted = backend.get_code_relationships(limit=10)
+        assert len(persisted) == 1
+        assert persisted[0].from_entity == "source_handler"
+        assert persisted[0].to_entity == "helper"
+        assert persisted[0].relationship_type == "function_call"
+
+    def test_research_uses_persisted_graph_relationships(self, backend):
+        """Graph relationships should expand research even without extracted entities."""
+        source_chunk = Chunk(
+            id=ChunkId("source-1"),
+            symbol="source_handler",
+            start_line=LineNumber(1),
+            end_line=LineNumber(3),
+            code="def source_handler():\n    return 1",
+            chunk_type=ChunkType.FUNCTION,
+            language=Language.PYTHON,
+            file_path=FilePath("app/source.py"),
+        )
+        target_chunk = Chunk(
+            id=ChunkId("target-1"),
+            symbol="helper",
+            start_line=LineNumber(1),
+            end_line=LineNumber(2),
+            code="def helper():\n    return 2",
+            chunk_type=ChunkType.FUNCTION,
+            language=Language.PYTHON,
+            file_path=FilePath("app/helper.py"),
+        )
+
+        backend.add_code_relationships(
+            [
+                CodeRelationshipRecord(
+                    from_entity="source_handler",
+                    to_entity="helper",
+                    relationship_type="function_call",
+                    from_chunk_id="source-1",
+                    to_chunk_id="target-1",
+                )
+            ]
+        )
+
+        strategy = MultiHopSearchStrategy(backend, max_hops=1)
+
+        def mock_initial_search(question, k):
+            return [SearchResult(chunk=source_chunk, score=1.0)]
+
+        def mock_search_lexical(query, k=3, include_deps=True, tier_boost=None):
+            if query != "helper":
+                return []
+            return [SearchResult(chunk=target_chunk, score=0.9)]
+
+        def mock_extract_from_chunk(chunk):
+            return []
+
+        strategy._initial_search = mock_initial_search
+        strategy.extractor.extract_from_chunk = mock_extract_from_chunk
+        backend.search_lexical = mock_search_lexical
+
+        result = strategy.research("trace source handler", max_results_per_hop=5)
+        symbols = {chunk.symbol for chunk in result.chunks}
+        assert "source_handler" in symbols
+        assert "helper" in symbols
 
 
 class TestCallGraphBuilding:

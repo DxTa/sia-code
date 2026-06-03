@@ -81,7 +81,37 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def create_backend(index_path: Path, config: Config, valid_chunks=None):
+def _parse_alternatives(alternatives: str | None) -> list[dict[str, str]]:
+    """Convert comma-separated alternatives into decision records."""
+    if not alternatives:
+        return []
+    return [{"option": alternative.strip()} for alternative in alternatives.split(",")]
+
+
+def _build_conceptual_links(
+    link_files: tuple[str, ...],
+    link_symbols: tuple[str, ...],
+    link_timeline_refs: tuple[str, ...],
+    link_changelog_tags: tuple[str, ...],
+) -> list[dict[str, str]]:
+    """Build conceptual link payload for decision storage."""
+    conceptual_links: list[dict[str, str]] = []
+    for link_type, refs in (
+        ("file", link_files),
+        ("symbol", link_symbols),
+        ("timeline", link_timeline_refs),
+        ("changelog", link_changelog_tags),
+    ):
+        conceptual_links.extend({"type": link_type, "ref": ref} for ref in refs)
+    return conceptual_links
+
+
+def create_backend(
+    index_path: Path,
+    config: Config,
+    valid_chunks=None,
+    suppress_stdout_notices: bool = False,
+):
     """Create storage backend with config-based embedding settings.
 
     Args:
@@ -96,15 +126,37 @@ def create_backend(index_path: Path, config: Config, valid_chunks=None):
 
     configured_backend = config.storage.backend
     detected_backend = factory.get_backend_type(index_path)
+    storage_fields_set = getattr(config.storage, "model_fields_set", set())
+    backend_explicitly_set = "backend" in storage_fields_set
+    effective_backend = configured_backend
+
+    # Compatibility path: older config files without storage.backend now default to
+    # sqlite-vec, but existing repositories may still carry legacy usearch indexes.
+    is_implicit_sqlite_default_on_legacy_usearch = (
+        configured_backend == "sqlite-vec"
+        and detected_backend == "usearch"
+        and not backend_explicitly_set
+    )
+    if is_implicit_sqlite_default_on_legacy_usearch:
+        if not suppress_stdout_notices:
+            console.print(
+                "[yellow]Detected legacy usearch index with implicit storage backend.[/yellow] "
+                "Using legacy backend for compatibility."
+            )
+            console.print(
+                "[dim]Set 'storage.backend=sqlite-vec' and run 'sia-code index --clean .' "
+                "to migrate when ready.[/dim]"
+            )
+        effective_backend = "auto"
 
     if (
-        configured_backend != "auto"
+        effective_backend != "auto"
         and detected_backend != "none"
-        and configured_backend != detected_backend
+        and effective_backend != detected_backend
     ):
         console.print(
             "[red]Backend mismatch:[/red] "
-            f"config requests '{configured_backend}' but index contains '{detected_backend}'."
+            f"config requests '{effective_backend}' but index contains '{detected_backend}'."
         )
         console.print(
             "[dim]Option 1: keep existing index with "
@@ -113,17 +165,20 @@ def create_backend(index_path: Path, config: Config, valid_chunks=None):
         console.print("[dim]Option 2: migrate by running 'sia-code index --clean .'[/dim]")
         sys.exit(1)
 
-    if configured_backend == "auto" and detected_backend == "usearch":
-        console.print("[yellow]Detected legacy usearch index.[/yellow] Using it for compatibility.")
-        console.print(
-            "[dim]Set 'storage.backend=usearch' to pin legacy mode, "
-            "or run 'sia-code index --clean .' to migrate to sqlite-vec.[/dim]"
-        )
+    if effective_backend == "auto" and detected_backend == "usearch":
+        if not suppress_stdout_notices:
+            console.print(
+                "[yellow]Detected legacy usearch index.[/yellow] Using it for compatibility."
+            )
+            console.print(
+                "[dim]Set 'storage.backend=usearch' to pin legacy mode, "
+                "or run 'sia-code index --clean .' to migrate to sqlite-vec.[/dim]"
+            )
 
     # Use configured backend; auto-detection defaults to sqlite-vec for new indexes.
     return factory.create_backend(
         path=index_path,
-        backend_type=configured_backend,
+        backend_type=effective_backend,
         embedding_enabled=config.embedding.enabled,
         embedding_model=config.embedding.model,
         ndim=config.embedding.dimensions,
@@ -219,6 +274,52 @@ def get_git_commit_context(base_dir: Path) -> tuple[str | None, datetime | None]
     commit_time_raw = time_result.stdout.strip()
     commit_time = datetime.fromisoformat(commit_time_raw) if commit_time_raw else None
     return commit_hash, commit_time
+
+
+def get_git_branch_context(base_dir: Path) -> str:
+    """Return the current branch name, or a stable workspace label."""
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=base_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return base_dir.resolve().name
+
+    branch = branch_result.stdout.strip()
+    if branch and branch != "HEAD":
+        return branch
+    return base_dir.resolve().name
+
+
+def build_working_memory_payload(
+    backend,
+    query: str,
+    agent: str | None,
+    session_id: str | None,
+    base_dir: Path,
+) -> dict[str, object]:
+    """Build a shared working-memory payload for agent handoff."""
+    commit_hash, commit_time = get_git_commit_context(base_dir)
+    context = backend.generate_context(query=query)
+
+    return {
+        "working_memory": {
+            "generated_at": datetime.now().isoformat(),
+            "agent": agent,
+            "session_id": session_id,
+            "query": query,
+            "git": {
+                "branch": get_git_branch_context(base_dir),
+                "commit_hash": commit_hash,
+                "commit_time": commit_time.isoformat() if commit_time else None,
+            },
+            "project_memory": context["project_memory"],
+        }
+    }
 
 
 def resolve_index_dir(project_dir: Path | None = None) -> Path:
@@ -1215,7 +1316,7 @@ def compact(path: str, threshold: float, force: bool):
     console.print(f"  Status: {summary.status}\n")
 
     # Load backend
-    backend = create_backend(sia_dir, config)
+    backend = create_backend(sia_dir, config, suppress_stdout_notices=True)
     backend.open_index(writable=True)
 
     coordinator = IndexingCoordinator(config, backend)
@@ -1506,7 +1607,40 @@ def memory_sync_git(since, limit, dry_run, tags_only, merges_only, min_importanc
 @click.option("--description", "-d", required=True, help="Full description")
 @click.option("--reasoning", "-r", help="Why this decision was made")
 @click.option("--alternatives", "-a", help="Comma-separated list of alternatives considered")
-def memory_add_decision(title, description, reasoning, alternatives):
+@click.option(
+    "--link-file",
+    "link_files",
+    multiple=True,
+    help="Link decision to file path (repeatable)",
+)
+@click.option(
+    "--link-symbol",
+    "link_symbols",
+    multiple=True,
+    help="Link decision to symbol/entity (repeatable)",
+)
+@click.option(
+    "--link-timeline",
+    "link_timeline_refs",
+    multiple=True,
+    help="Link decision to timeline ref (repeatable)",
+)
+@click.option(
+    "--link-changelog",
+    "link_changelog_tags",
+    multiple=True,
+    help="Link decision to changelog tag (repeatable)",
+)
+def memory_add_decision(
+    title,
+    description,
+    reasoning,
+    alternatives,
+    link_files,
+    link_symbols,
+    link_timeline_refs,
+    link_changelog_tags,
+):
     """Add a pending technical decision.
 
     Example: sia-code memory add-decision "Use PostgreSQL" -d "Need ACID compliance" -r "Better than MySQL for our use case"
@@ -1516,11 +1650,13 @@ def memory_add_decision(title, description, reasoning, alternatives):
     backend.open_index(writable=True)
 
     try:
-        # Parse alternatives
-        alt_list = []
-        if alternatives:
-            for alt in alternatives.split(","):
-                alt_list.append({"option": alt.strip()})
+        alt_list = _parse_alternatives(alternatives)
+        conceptual_links = _build_conceptual_links(
+            link_files=link_files,
+            link_symbols=link_symbols,
+            link_timeline_refs=link_timeline_refs,
+            link_changelog_tags=link_changelog_tags,
+        )
 
         # Get session ID (simple timestamp-based)
         import datetime
@@ -1535,6 +1671,7 @@ def memory_add_decision(title, description, reasoning, alternatives):
             description=description,
             reasoning=reasoning,
             alternatives=alt_list,
+            conceptual_links=conceptual_links,
             commit_hash=commit_hash,
             commit_time=commit_time,
         )
@@ -1762,6 +1899,153 @@ def memory_search(query, search_type, limit):
     except Exception as e:
         console.print(f"[red]Error searching memory: {e}[/red]")
         sys.exit(1)
+
+
+@memory.command(name="working-set")
+@click.argument("query")
+@click.option("--agent", type=str, help="Agent name using this shared working-memory payload")
+@click.option("--session-id", type=str, help="Session identifier for multi-step agent work")
+@click.option("-o", "--output", type=click.Path(), help="Write JSON payload to file")
+def memory_working_set(query, agent, session_id, output):
+    """Build a shared working-memory JSON payload for agents.
+
+    Example: sia-code memory working-set "auth flow" --agent planner --session-id ses-123
+    """
+    import json
+
+    sia_dir, config = require_initialized()
+    backend = create_backend(sia_dir, config, suppress_stdout_notices=True)
+    backend.open_index()
+
+    try:
+        payload = build_working_memory_payload(
+            backend=backend,
+            query=query,
+            agent=agent,
+            session_id=session_id,
+            base_dir=Path("."),
+        )
+
+        if output:
+            output_path = Path(output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(payload, indent=2))
+            console.print(f"[green]✓[/green] Working memory written to {output_path}")
+        else:
+            sys.stdout.write(json.dumps(payload, indent=2))
+            sys.stdout.write("\n")
+    except Exception as e:
+        console.print(f"[red]Error building working memory: {e}[/red]")
+        sys.exit(1)
+    finally:
+        backend.close()
+
+
+@memory.command(name="trace")
+@click.argument("query")
+@click.option("--hops", type=int, default=1, help="Graph expansion hops from seed symbols")
+@click.option("--seed-limit", type=int, default=5, help="Lexical seed count for query and edges")
+@click.option("--timeline-limit", type=int, default=100, help="Timeline events to score")
+@click.option("-k", "--limit", type=int, default=10, help="Maximum ranked events to return")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["text", "json", "table"]),
+    default="text",
+    help="Output format",
+)
+def memory_trace(query, hops, seed_limit, timeline_limit, limit, output_format):
+    """Trace timeline events likely related to a query.
+
+    Combines lexical seeds, persisted code relationships, and timeline file overlap
+    to answer "when did this behavior likely change?" questions.
+    """
+    import json
+    from .memory.causal_trace import CausalTracer
+
+    sia_dir, config = require_initialized()
+    backend = create_backend(sia_dir, config)
+    backend.open_index()
+
+    try:
+        tracer = CausalTracer(backend)
+        result = tracer.trace(
+            query=query,
+            hops=max(0, hops),
+            seed_limit=max(1, seed_limit),
+            timeline_limit=max(1, timeline_limit),
+            limit=max(1, limit),
+        )
+
+        if output_format == "json":
+            payload = {
+                "query": result.query,
+                "seed_symbols": result.seed_symbols,
+                "related_symbols": result.related_symbols,
+                "related_files": result.related_files,
+                "events": [
+                    {
+                        "score": event.score,
+                        "matched_files": event.matched_files,
+                        "event": event.event.to_dict(),
+                    }
+                    for event in result.events
+                ],
+            }
+            console.print(json.dumps(payload, indent=2))
+            return
+
+        if output_format == "table":
+            if not result.events:
+                console.print("[yellow]No causal timeline events found.[/yellow]")
+                return
+
+            table = Table(title=f"Temporal Trace: {query}")
+            table.add_column("Score", style="cyan")
+            table.add_column("Importance")
+            table.add_column("From -> To")
+            table.add_column("Matched Files")
+            table.add_column("Summary")
+
+            for item in result.events:
+                table.add_row(
+                    f"{item.score:.1f}",
+                    item.event.importance,
+                    f"{item.event.from_ref} -> {item.event.to_ref}",
+                    ", ".join(item.matched_files[:2]),
+                    item.event.summary[:60],
+                )
+
+            console.print(table)
+            return
+
+        console.print(f"[bold]Temporal Trace:[/bold] {query}\n")
+        console.print(
+            f"Seed symbols: {', '.join(result.seed_symbols) if result.seed_symbols else 'none'}"
+        )
+        console.print(f"Related symbols: {len(result.related_symbols)}")
+        console.print(f"Related files: {len(result.related_files)}\n")
+
+        if not result.events:
+            console.print("[yellow]No causal timeline events found.[/yellow]")
+            return
+
+        for idx, item in enumerate(result.events, 1):
+            event = item.event
+            console.print(
+                f"{idx}. [cyan]score={item.score:.1f}[/cyan] "
+                f"[{event.importance}] {event.from_ref} -> {event.to_ref}"
+            )
+            console.print(f"   {event.summary}")
+            console.print(f"   matched files: {', '.join(item.matched_files)}")
+            if event.created_at:
+                console.print(f"   at: {event.created_at.isoformat()}")
+            console.print()
+    except Exception as e:
+        console.print(f"[red]Error tracing memory timeline: {e}[/red]")
+        sys.exit(1)
+    finally:
+        backend.close()
 
 
 @memory.command(name="timeline")

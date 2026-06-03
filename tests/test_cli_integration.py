@@ -1,13 +1,13 @@
 """Integration test for Sia Code CLI."""
 
-import pytest
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-import os
-import shutil
+
+import pytest
 
 
 @pytest.fixture
@@ -269,6 +269,161 @@ class TestCLICompact:
 
         # Should either compact or say not needed
         assert result.returncode == 0
+
+
+class TestCLIMemory:
+    """Test memory subcommands."""
+
+    def test_memory_trace_not_initialized(self, test_project):
+        """memory trace should fail when repo is not initialized."""
+        result = run_cli(["memory", "trace", "hello_world"], cwd=test_project)
+
+        assert result.returncode != 0
+
+    def test_memory_trace_after_init_returns_success(self, test_project):
+        """memory trace should run successfully after init/index."""
+        run_cli(["init"], cwd=test_project)
+        disable_embeddings(test_project)
+        run_cli(["index", "."], cwd=test_project)
+
+        result = run_cli(
+            ["memory", "trace", "hello_world", "--format", "json"],
+            cwd=test_project,
+        )
+
+        assert result.returncode == 0
+        assert '"query": "hello_world"' in result.stdout
+
+    def test_memory_add_decision_with_conceptual_links(self, test_project):
+        """memory add-decision should persist conceptual links."""
+        run_cli(["init"], cwd=test_project)
+        disable_embeddings(test_project)
+        run_cli(["index", "."], cwd=test_project)
+
+        create_result = run_cli(
+            [
+                "memory",
+                "add-decision",
+                "Conceptual memory links",
+                "-d",
+                "Attach rationale to physical code artifacts",
+                "--link-file",
+                "sia_code/cli.py",
+                "--link-symbol",
+                "memory_trace",
+                "--link-timeline",
+                "feature/x->main",
+                "--link-changelog",
+                "v0.7.0",
+            ],
+            cwd=test_project,
+        )
+        assert create_result.returncode == 0
+
+        list_result = run_cli(
+            ["memory", "list", "--type", "decision", "--status", "pending", "--format", "json"],
+            cwd=test_project,
+        )
+        assert list_result.returncode == 0
+
+        payload = json.loads(list_result.stdout)
+        assert payload["decisions"]
+
+        links = payload["decisions"][0]["conceptual_links"]
+        link_pairs = {(item["type"], item["ref"]) for item in links}
+        assert ("file", "sia_code/cli.py") in link_pairs
+        assert ("symbol", "memory_trace") in link_pairs
+        assert ("timeline", "feature/x->main") in link_pairs
+        assert ("changelog", "v0.7.0") in link_pairs
+
+    def test_memory_working_set_returns_query_scoped_json(self, test_project):
+        """memory working-set should emit agent-readable JSON context."""
+        run_cli(["init"], cwd=test_project)
+        disable_embeddings(test_project)
+        run_cli(["index", "."], cwd=test_project)
+
+        result = run_cli(
+            [
+                "memory",
+                "working-set",
+                "hello_world",
+                "--agent",
+                "planner",
+                "--session-id",
+                "ses-123",
+            ],
+            cwd=test_project,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        working_memory = payload["working_memory"]
+        assert working_memory["agent"] == "planner"
+        assert working_memory["session_id"] == "ses-123"
+        assert working_memory["query"] == "hello_world"
+        assert working_memory["project_memory"]["relevant_code"]
+
+    def test_memory_working_set_writes_output_file(self, test_project):
+        """memory working-set should persist the shared working-memory payload."""
+        run_cli(["init"], cwd=test_project)
+        disable_embeddings(test_project)
+        run_cli(["index", "."], cwd=test_project)
+
+        output_path = test_project / "shared-working-memory.json"
+        result = run_cli(
+            [
+                "memory",
+                "working-set",
+                "hello_world",
+                "--output",
+                str(output_path),
+            ],
+            cwd=test_project,
+        )
+
+        assert result.returncode == 0
+        assert output_path.exists()
+        payload = json.loads(output_path.read_text())
+        assert payload["working_memory"]["query"] == "hello_world"
+        assert payload["working_memory"]["git"]["branch"]
+
+    def test_memory_working_set_includes_approved_decisions(self, test_project):
+        """working-set should include approved shared-memory decisions."""
+        run_cli(["init"], cwd=test_project)
+        disable_embeddings(test_project)
+        run_cli(["index", "."], cwd=test_project)
+
+        create_result = run_cli(
+            [
+                "memory",
+                "add-decision",
+                "Persist architecture intent",
+                "-d",
+                "Capture an approved decision in shared memory",
+            ],
+            cwd=test_project,
+        )
+        assert create_result.returncode == 0
+
+        list_result = run_cli(
+            ["memory", "list", "--type", "decision", "--status", "pending", "--format", "json"],
+            cwd=test_project,
+        )
+        decision_id = json.loads(list_result.stdout)["decisions"][0]["id"]
+
+        approve_result = run_cli(
+            ["memory", "approve", str(decision_id), "--category", "architecture"],
+            cwd=test_project,
+        )
+        assert approve_result.returncode == 0
+
+        working_set = run_cli(["memory", "working-set", "architecture"], cwd=test_project)
+        assert working_set.returncode == 0
+
+        payload = json.loads(working_set.stdout)
+        approved = payload["working_memory"]["project_memory"]["approved_decisions"]
+        assert approved
+        assert approved[0]["title"] == "Persist architecture intent"
 
 
 if __name__ == "__main__":

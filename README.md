@@ -21,11 +21,18 @@ Sia Code indexes your repo and lets you:
 # pip
 pip install sia-code
 
+# pip with MCP server support
+pip install "sia-code[mcp]"
+
 # or uv tool
 uv tool install sia-code
 
+# MCP entrypoint from PyPI/local checkout
+uv tool install "sia-code[mcp]"
+
 # verify
 sia-code --version
+sia-code-mcp --help
 ```
 
 ## Quick Start (2 minutes)
@@ -58,6 +65,8 @@ sia-code status
 | `sia-code research "question"` | Multi-hop relationship discovery |
 | `sia-code memory sync-git` | Import timeline/changelog from git |
 | `sia-code memory search "topic"` | Search stored project memory |
+| `sia-code memory working-set "query"` | Build shared working-memory JSON for agents |
+| `sia-code memory trace "query"` | Trace likely causal timeline events for query |
 | `sia-code config show` | Print active configuration |
 
 ## Search Modes (important)
@@ -86,20 +95,37 @@ How semantic summary generation works:
 
 ```bash
 sia-code memory sync-git
+sia-code memory working-set "auth flow" --agent planner --session-id ses-123
+sia-code memory trace "why did command parsing change" --format table
+sia-code memory add-decision "Keep sqlite-vec default" \
+  -d "Need a stable local-first backend baseline" \
+  -r "Consistent behavior across environments" \
+  --link-file sia_code/config.py \
+  --link-symbol default_backend \
+  --link-timeline "feature/sqlite-vec->main"
 sia-code memory changelog --format markdown
 ```
 
 ## LLM CLI Integration
 
-This repo includes a compact reusable skill at:
+Primary integration is now the packaged MCP server:
 
-- `skills/sia-code/SKILL.md`
+- `sia-code-mcp`
+
+For engineering workflows, the preferred first MCP call is:
+
+- `engineering_bootstrap`
+
+It bundles readiness checks, lightweight search, optional memory retrieval, and guarded multi-hop research so MCP-aware clients can use Sia Code effectively with only a bare MCP server configuration.
 
 Integration guide:
 
+- `docs/MCP_INTEGRATION.md`
 - `docs/LLM_CLI_INTEGRATION.md`
 
-In short: copy that skill file into your LLM CLI skill directory, then load `sia-code` in your session.
+Fallback skill file for environments without MCP support:
+
+- `skills/sia-code/SKILL.md`
 
 ## Configuration
 
@@ -173,6 +199,7 @@ Practical guidance:
 ## Documentation
 
 - `docs/CLI_FEATURES.md` - concise CLI command reference
+- `docs/MCP_INTEGRATION.md` - MCP setup and transport notes
 - `docs/CODE_STRUCTURE.md` - repo/module map
 - `docs/ARCHITECTURE.md` - core runtime architecture
 - `docs/INDEXING.md` - indexing behavior and maintenance

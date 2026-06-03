@@ -29,11 +29,13 @@ sia-code status
 | Command | Purpose | Key options |
 | --- | --- | --- |
 | `memory sync-git` | Import timeline/changelog from git (with diff stats and optional local semantic summaries) | `--since`, `--limit`, `--dry-run`, `--tags-only`, `--merges-only`, `--min-importance` |
-| `memory add-decision TITLE` | Add pending decision | `-d/--description` (required), `-r/--reasoning`, `-a/--alternatives` |
+| `memory add-decision TITLE` | Add pending decision with optional conceptual links to code/timeline artifacts | `-d/--description` (required), `-r/--reasoning`, `-a/--alternatives`, `--link-file`, `--link-symbol`, `--link-timeline`, `--link-changelog` |
 | `memory list` | List memory items | `--type`, `--status`, `--limit`, `--format` |
 | `memory approve ID` | Approve decision | `-c/--category` (required) |
 | `memory reject ID` | Reject decision | none |
 | `memory search QUERY` | Search memory | `--type`, `-k/--limit` |
+| `memory working-set QUERY` | Build shared working-memory JSON for agent handoff | `--agent`, `--session-id`, `-o/--output` |
+| `memory trace QUERY` | Trace likely causal timeline events for a code query (graph + timeline overlap) | `--hops`, `--seed-limit`, `--timeline-limit`, `-k/--limit`, `--format` |
 | `memory timeline` | View timeline events | `--since`, `--event-type`, `--importance`, `--format` |
 | `memory changelog [RANGE]` | Generate changelog | `--format`, `--output` |
 | `memory export` / `memory import` | Backup/restore memory | `-o/--output`, `-i/--input` |
