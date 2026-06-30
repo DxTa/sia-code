@@ -269,7 +269,7 @@ def build_repo_config(base_config: Config, repo_name: str) -> Config:
         config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 120)
         config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.9)
         config.embedding.granularity = "budget"
-        config.embedding.max_vectors_per_file = 16
+        config.embedding.max_vectors_per_file = 24
         if is_model_cached("BAAI/bge-small-en-v1.5"):
             config.embedding.model = "BAAI/bge-small-en-v1.5"
             config.embedding.dimensions = 384
@@ -278,7 +278,7 @@ def build_repo_config(base_config: Config, repo_name: str) -> Config:
         config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 140)
         config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.92)
         config.embedding.granularity = "budget"
-        config.embedding.max_vectors_per_file = 12
+        config.embedding.max_vectors_per_file = 16
         if is_model_cached("BAAI/bge-small-en-v1.5"):
             config.embedding.model = "BAAI/bge-small-en-v1.5"
             config.embedding.dimensions = 384
