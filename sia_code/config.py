@@ -198,6 +198,25 @@ class GitDynamicConfig(BaseModel):
     narrative_model: str | None = None  # None = auto-select (large on 16GB+, base otherwise)
 
 
+class RepoIndexOverride(BaseModel):
+    """Repo-specific indexing policy override for multi-repo workspaces."""
+
+    index_first: list[str] = Field(default_factory=list)
+    dependency_tier: list[str] = Field(default_factory=list)
+    lazy_index: list[str] = Field(default_factory=list)
+    skip: list[str] = Field(default_factory=list)
+
+
+class MultiRepoConfig(BaseModel):
+    """Workspace-level multi-repo indexing controls."""
+
+    enabled: bool = True
+    fanout_concurrency: int = 1
+    heavy_repo_chunk_threshold: int = 4000
+    heavy_repo_run_dependency_tier: bool = False
+    repo_overrides: dict[str, RepoIndexOverride] = Field(default_factory=dict)
+
+
 class StorageConfig(BaseModel):
     """Storage backend selection configuration."""
 
@@ -220,6 +239,7 @@ class Config(BaseModel):
     summarization: SummarizationConfig = Field(default_factory=SummarizationConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     git_dynamic: GitDynamicConfig = Field(default_factory=GitDynamicConfig)
+    multi_repo: MultiRepoConfig = Field(default_factory=MultiRepoConfig)
 
     @classmethod
     def load(cls, path: Path) -> "Config":

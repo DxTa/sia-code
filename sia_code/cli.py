@@ -558,7 +558,9 @@ def index(
     # Auto-detect multi-repo workspace (multiple git sub-repos)
     from .storage.multi_repo import (
         build_registry,
+        build_repo_config,
         detect_sub_repos,
+        estimate_chunks,
         estimate_indexable_files,
         get_registry_path,
         is_multi_repo_workspace,
@@ -606,10 +608,10 @@ def index(
             repo_index_dir = workspace_sia / "repos" / repo_path.name
             repo_index_dir.mkdir(parents=True, exist_ok=True)
 
-            # Write config for this sub-index
+            # Build per-repo config override and persist for this sub-index
+            repo_config = build_repo_config(config, repo_path.name)
             repo_config_path = repo_index_dir / "config.json"
-            if not repo_config_path.exists():
-                config.save(repo_config_path)
+            repo_config.save(repo_config_path)
 
             # Update registry to point to workspace-level index dir
             for entry in registry.repos:
@@ -620,11 +622,21 @@ def index(
                     break
 
             # Estimate size for timeout sizing and visibility
-            estimated_files = estimate_indexable_files(repo_path, config)
-            repo_timeout = recommend_repo_timeout_seconds(estimated_files)
-            console.print(
-                f"    [dim]~{estimated_files} files, timeout {repo_timeout}s[/dim]"
+            estimated_files = estimate_indexable_files(repo_path, repo_config)
+            estimated_chunks = estimate_chunks(repo_path, repo_config)
+            repo_timeout = recommend_repo_timeout_seconds(
+                estimated_files, estimated_chunks
             )
+            console.print(
+                f"    [dim]~{estimated_files} files, ~{estimated_chunks} chunks, timeout {repo_timeout}s[/dim]"
+            )
+            for entry in registry.repos:
+                if entry.name == repo_path.name:
+                    entry.estimated_chunks = estimated_chunks
+                    entry.status = "indexing"
+                    entry.last_error = None
+                    break
+            registry.save(registry_path)
 
             # Index in subprocess (crash-isolated, dynamic timeout per repo)
             clean_flag = "True" if clean else "False"
@@ -674,6 +686,8 @@ def index(
                         if entry.name == repo_path.name:
                             entry.indexed_at = datetime.now(timezone.utc).isoformat()
                             entry.file_count = stats.get("indexed_files", 0)
+                            entry.status = "full"
+                            entry.last_error = None
                             break
                     registry.save(registry_path)
                     console.print(
@@ -683,16 +697,34 @@ def index(
                     )
                 else:
                     err_lines = result.stderr.strip().splitlines()
-                    err_msg = err_lines[-1][:80] if err_lines else "unknown"
+                    err_msg = err_lines[-1][:120] if err_lines else "unknown"
+                    for entry in registry.repos:
+                        if entry.name == repo_path.name:
+                            entry.status = "failed"
+                            entry.last_error = err_msg
+                            break
+                    registry.save(registry_path)
                     console.print(
                         f"    [red]✗ Failed ({_elapsed:.1f}s): {err_msg}[/red]"
                     )
             except _sp.TimeoutExpired:
                 _elapsed = _time.monotonic() - _t0
+                for entry in registry.repos:
+                    if entry.name == repo_path.name:
+                        entry.status = "timed_out"
+                        entry.last_error = f"timeout after {repo_timeout}s"
+                        break
+                registry.save(registry_path)
                 console.print(
                     f"    [yellow]⚠ Timeout ({_elapsed:.0f}s/{repo_timeout}s) — skipped[/yellow]"
                 )
             except Exception as e:
+                for entry in registry.repos:
+                    if entry.name == repo_path.name:
+                        entry.status = "failed"
+                        entry.last_error = str(e)[:120]
+                        break
+                registry.save(registry_path)
                 console.print(f"    [red]✗ Failed: {e}[/red]")
 
         # Save registry
@@ -1416,33 +1448,95 @@ def status():
     # Multi-repo aggregate status
     multi_backends = get_multi_repo_backends()
     if multi_backends:
+        from .storage.multi_repo import MultiRepoRegistry, get_registry_path
+
+        registry = MultiRepoRegistry.load(get_registry_path(Path.cwd()))
         total_files = 0
         total_chunks = 0
         repo_rows = []
+        status_counts: dict[str, int] = {}
+        meta_by_name = {entry.name: entry for entry in (registry.repos if registry else [])}
         for repo_name, backend in multi_backends:
             try:
                 stats = backend.get_stats()
                 total_files += stats.total_files
                 total_chunks += stats.total_chunks
-                repo_rows.append((repo_name, stats.total_files, stats.total_chunks))
+                meta = meta_by_name.get(repo_name)
+                status_value = meta.status if meta else "indexed"
+                if status_value == "pending" and stats.total_chunks > 0:
+                    status_value = "indexed"
+                status_counts[status_value] = status_counts.get(status_value, 0) + 1
+                repo_rows.append(
+                    (
+                        repo_name,
+                        status_value,
+                        meta.estimated_chunks if meta else 0,
+                        stats.total_files,
+                        stats.total_chunks,
+                        meta.last_error if meta else None,
+                    )
+                )
             except Exception:
-                pass
+                meta = meta_by_name.get(repo_name)
+                status_value = meta.status if meta else "error"
+                status_counts[status_value] = status_counts.get(status_value, 0) + 1
+                repo_rows.append(
+                    (
+                        repo_name,
+                        status_value,
+                        meta.estimated_chunks if meta else 0,
+                        0,
+                        0,
+                        meta.last_error if meta else None,
+                    )
+                )
+
+        if registry:
+            for entry in registry.repos:
+                if entry.name not in {row[0] for row in repo_rows}:
+                    status_counts[entry.status] = status_counts.get(entry.status, 0) + 1
+                    repo_rows.append(
+                        (
+                            entry.name,
+                            entry.status,
+                            entry.estimated_chunks,
+                            0,
+                            0,
+                            entry.last_error,
+                        )
+                    )
 
         table = Table(title="Sia Code Index Status (Multi-Repo)")
         table.add_column("Property", style="cyan")
         table.add_column("Value", style="green")
         table.add_row("Workspace Index Path", str(sia_dir))
-        table.add_row("Registered Repos", f"{len(multi_backends):,}")
+        table.add_row("Registered Repos", f"{len(repo_rows):,}")
+        table.add_row("Indexed Repos", f"{len(multi_backends):,}")
         table.add_row("Total Files", f"{total_files:,}")
         table.add_row("Total Chunks", f"{total_chunks:,}")
+        if status_counts:
+            table.add_row(
+                "Repo States",
+                ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items())),
+            )
         console.print(table)
 
         repo_table = Table(title="Per-Repo Status")
         repo_table.add_column("Repo", style="cyan")
+        repo_table.add_column("State")
+        repo_table.add_column("Est Chunks", justify="right")
         repo_table.add_column("Files", justify="right")
         repo_table.add_column("Chunks", justify="right")
-        for repo_name, files_n, chunks_n in repo_rows:
-            repo_table.add_row(repo_name, f"{files_n:,}", f"{chunks_n:,}")
+        repo_table.add_column("Last Error", overflow="fold")
+        for repo_name, state, est_chunks, files_n, chunks_n, last_error in sorted(repo_rows):
+            repo_table.add_row(
+                repo_name,
+                state,
+                f"{est_chunks:,}" if est_chunks else "-",
+                f"{files_n:,}",
+                f"{chunks_n:,}",
+                (last_error or "")[:80],
+            )
         console.print(repo_table)
         return
 

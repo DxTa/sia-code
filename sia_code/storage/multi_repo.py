@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pathspec
 
+from ..config import Config, RepoIndexOverride
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +28,9 @@ class RepoEntry:
     index_dir: str  # relative path to .sia-code/ dir
     indexed_at: str | None = None
     file_count: int = 0
+    estimated_chunks: int = 0
+    status: str = "pending"
+    last_error: str | None = None
 
 
 @dataclass
@@ -49,6 +54,9 @@ class MultiRepoRegistry:
                     "index_dir": r.index_dir,
                     "indexed_at": r.indexed_at,
                     "file_count": r.file_count,
+                    "estimated_chunks": r.estimated_chunks,
+                    "status": r.status,
+                    "last_error": r.last_error,
                 }
                 for r in self.repos
             ],
@@ -72,6 +80,9 @@ class MultiRepoRegistry:
                         index_dir=r["index_dir"],
                         indexed_at=r.get("indexed_at"),
                         file_count=r.get("file_count", 0),
+                        estimated_chunks=r.get("estimated_chunks", 0),
+                        status=r.get("status", "pending"),
+                        last_error=r.get("last_error"),
                     )
                     for r in data.get("repos", [])
                 ],
@@ -136,6 +147,68 @@ def build_registry(workspace_root: Path, repos: list[Path]) -> MultiRepoRegistry
     )
 
 
+def get_repo_override(config: Config, repo_name: str) -> RepoIndexOverride | None:
+    """Return repo-specific indexing override, including built-in defaults."""
+    override = config.multi_repo.repo_overrides.get(repo_name)
+    if override:
+        return override
+
+    # Built-in performance policy for known heavy mixed repo.
+    if repo_name == "ai.platform.forks.ai-toolkit":
+        return RepoIndexOverride(
+            index_first=[
+                "toolkit/**",
+                "jobs/**",
+                "ui/src/**",
+                "ui/cron/**",
+                "ui/prisma/schema.prisma",
+                "run.py",
+                "run_modal.py",
+                "flux_train_ui.py",
+            ],
+            dependency_tier=[
+                "extensions_built_in/diffusion_models/**/src/**",
+            ],
+            lazy_index=[
+                "config/examples/**",
+                "scripts/**",
+                "testing/**",
+                "docker/**",
+                "extensions/example/**",
+            ],
+            skip=[
+                "output/**",
+                "assets/**",
+                "notebooks/**",
+                "ui/public/**",
+                "ui/package-lock.json",
+                "toolkit/keymaps/**",
+                ".github/**",
+                ".vscode/**",
+            ],
+        )
+    return None
+
+
+def build_repo_config(base_config: Config, repo_name: str) -> Config:
+    """Clone config and apply repo-specific override for faster indexing."""
+    config = base_config.model_copy(deep=True)
+    override = get_repo_override(config, repo_name)
+    if not override:
+        return config
+
+    if override.index_first:
+        config.indexing.include_patterns = override.index_first
+
+    merged_excludes = list(config.indexing.exclude_patterns)
+    for group in (override.dependency_tier, override.lazy_index, override.skip):
+        for pattern in group:
+            if pattern not in merged_excludes:
+                merged_excludes.append(pattern)
+    config.indexing.exclude_patterns = merged_excludes
+    return config
+
+
 def estimate_indexable_files(directory: Path, config) -> int:
     """Estimate how many files will be indexed for timeout sizing.
 
@@ -166,13 +239,55 @@ def estimate_indexable_files(directory: Path, config) -> int:
     return count
 
 
-def recommend_repo_timeout_seconds(file_count: int) -> int:
-    """Compute per-repo timeout from estimated file count.
+def estimate_chunks(directory: Path, config: Config) -> int:
+    """Estimate chunk count for timeout sizing.
 
-    Small repos keep 5m floor. Large repos scale up but stay bounded.
+    Uses real chunking against discovered files. This is cheap enough in practice
+    and much more accurate than file-count heuristics for monolithic repos.
     """
+    from ..core.types import Language
+    from ..parser.chunker import CASTChunker
+
+    effective_patterns = config.indexing.get_effective_exclude_patterns(directory)
+    spec = pathspec.PathSpec.from_lines("gitwildmatch", effective_patterns)
+    max_bytes = config.indexing.max_file_size_mb * 1024 * 1024
+    chunker = CASTChunker(config.chunking)
+    total = 0
+    seen: set[Path] = set()
+
+    for pattern in config.indexing.include_patterns:
+        glob_pattern = pattern if "*" in pattern else f"**/*{pattern}"
+        for file_path in directory.rglob(glob_pattern):
+            if not file_path.is_file() or file_path in seen:
+                continue
+            rel_path = file_path.relative_to(directory)
+            if spec.match_file(str(rel_path)):
+                continue
+            try:
+                file_size = file_path.stat().st_size
+            except OSError:
+                continue
+            if file_size == 0 or file_size > max_bytes:
+                continue
+            seen.add(file_path)
+            try:
+                language = Language.from_extension(file_path.suffix)
+                total += len(chunker.chunk_file(file_path, language))
+            except Exception:
+                continue
+    return total
+
+
+def recommend_repo_timeout_seconds(file_count: int, estimated_chunks: int = 0) -> int:
+    """Compute per-repo timeout.
+
+    Prefer chunk-based sizing because embedding/storage dominates runtime for
+    large monolithic repos. Bounded to 5m..45m.
+    """
+    if estimated_chunks > 0:
+        seconds = int(120 + (estimated_chunks / 20.0))
+        return max(300, min(2700, seconds))
     if file_count <= 0:
         return 300
-    # ~0.8s per file plus 60s overhead, bounded 5m..30m
     seconds = int(60 + file_count * 0.8)
     return max(300, min(1800, seconds))
