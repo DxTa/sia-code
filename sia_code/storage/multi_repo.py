@@ -242,19 +242,29 @@ def get_repo_override(config: Config, repo_name: str) -> RepoIndexOverride | Non
 def build_repo_config(base_config: Config, repo_name: str) -> Config:
     """Clone config and apply repo-specific override for faster indexing."""
     config = base_config.model_copy(deep=True)
+    profile = get_repo_profile(repo_name)
     override = get_repo_override(config, repo_name)
-    if not override:
-        return config
+    if override:
+        if override.index_first:
+            config.indexing.include_patterns = override.index_first
 
-    if override.index_first:
-        config.indexing.include_patterns = override.index_first
+        merged_excludes = list(config.indexing.exclude_patterns)
+        for group in (override.dependency_tier, override.lazy_index, override.skip):
+            for pattern in group:
+                if pattern not in merged_excludes:
+                    merged_excludes.append(pattern)
+        config.indexing.exclude_patterns = merged_excludes
 
-    merged_excludes = list(config.indexing.exclude_patterns)
-    for group in (override.dependency_tier, override.lazy_index, override.skip):
-        for pattern in group:
-            if pattern not in merged_excludes:
-                merged_excludes.append(pattern)
-    config.indexing.exclude_patterns = merged_excludes
+    # Profile-specific chunking for faster first-pass indexing.
+    # Heavy data-science / annotation repos benefit from fewer, larger chunks.
+    if profile == "data_science":
+        config.chunking.max_chunk_size = max(config.chunking.max_chunk_size, 1800)
+        config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 120)
+        config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.9)
+    elif profile == "annotation_platform":
+        config.chunking.max_chunk_size = max(config.chunking.max_chunk_size, 2200)
+        config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 140)
+        config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.92)
     return config
 
 
