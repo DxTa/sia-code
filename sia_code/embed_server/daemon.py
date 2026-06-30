@@ -137,12 +137,22 @@ class EmbedDaemon:
 
                 # Auto-detect device on first load
                 if not self.models:  # First model
-                    self.device = "cuda" if torch.cuda.is_available() else "cpu"
+                    if torch.cuda.is_available():
+                        self.device = "cuda"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        self.device = "mps"
+                    else:
+                        self.device = "cpu"
                     logger.info(f"Using device: {self.device}")
 
                 # Load model
                 model = SentenceTransformer(model_name, device=self.device)
                 self.models[model_name] = model
+
+                # After successful load, prevent future network calls
+                # Model is now cached locally — no need to hit HF Hub again
+                import os
+                os.environ["HF_HUB_OFFLINE"] = "1"
 
                 logger.info(f"Model loaded: {model_name} ({len(self.models)} total)")
 

@@ -4,7 +4,7 @@ import os
 import sys
 import logging
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -360,6 +360,34 @@ def require_initialized() -> tuple[Path, Config]:
     return sia_dir, config
 
 
+def get_multi_repo_backends(cwd: Path | None = None):
+    """Check if in a multi-repo workspace and return all backends.
+
+    Returns:
+        list of (repo_name, backend) tuples, or empty list if not multi-repo
+    """
+    from .storage.multi_repo import get_registry_path, MultiRepoRegistry
+
+    workspace = cwd or Path.cwd()
+    registry_path = get_registry_path(workspace)
+    registry = MultiRepoRegistry.load(registry_path)
+    if not registry or not registry.repos:
+        return []
+
+    backends = []
+    for entry in registry.repos:
+        repo_sia_dir = workspace / entry.index_dir
+        if (repo_sia_dir / "index.db").exists():
+            try:
+                config = Config.load(repo_sia_dir / "config.json")
+                backend = create_backend(repo_sia_dir, config, suppress_stdout_notices=True)
+                backend.open_index()
+                backends.append((entry.name, backend))
+            except Exception:
+                pass
+    return backends
+
+
 @click.group()
 @click.version_option(version=__version__)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
@@ -514,6 +542,89 @@ def index(
 
     # Index directory
     directory = Path(path).resolve()
+
+    # Auto-detect multi-repo workspace (multiple git sub-repos)
+    from .storage.multi_repo import (
+        detect_sub_repos,
+        is_multi_repo_workspace,
+        build_registry,
+        get_registry_path,
+    )
+
+    if is_multi_repo_workspace(directory):
+        sub_repos = detect_sub_repos(directory)
+        console.print(
+            f"[cyan]Detected multi-repo workspace with {len(sub_repos)} repos[/cyan]"
+        )
+        for repo in sub_repos:
+            console.print(f"  [dim]• {repo.name}[/dim]")
+        console.print()
+
+        # Fan-out: index each repo independently
+        registry = build_registry(directory, sub_repos)
+        all_stats = []
+
+        for i, repo_path in enumerate(sub_repos, 1):
+            console.print(
+                f"[cyan][{i}/{len(sub_repos)}] Indexing {repo_path.name}...[/cyan]"
+            )
+            repo_sia_dir = repo_path / ".sia-code"
+            repo_sia_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write minimal config if none exists
+            repo_config_path = repo_sia_dir / "config.json"
+            if not repo_config_path.exists():
+                config.save(repo_config_path)
+
+            # Create backend for this repo
+            repo_backend = create_backend(repo_sia_dir, config)
+            if clean:
+                index_path = repo_sia_dir / "index.db"
+                if index_path.exists():
+                    index_path.unlink()
+                repo_backend.create_index()
+            else:
+                try:
+                    repo_backend.open_index()
+                except Exception:
+                    repo_backend.create_index()
+
+            repo_coord = IndexingCoordinator(config, repo_backend)
+            try:
+                stats = repo_coord.index_directory(repo_path)
+                all_stats.append(stats)
+                # Update registry entry
+                for entry in registry.repos:
+                    if entry.name == repo_path.name:
+                        entry.indexed_at = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
+                        entry.file_count = stats.get("indexed_files", 0)
+                        break
+                console.print(
+                    f"    [green]✓[/green] {stats.get('indexed_files', 0)} files, "
+                    f"{stats.get('total_chunks', 0)} chunks"
+                )
+            except Exception as e:
+                console.print(f"    [red]✗ Failed: {e}[/red]")
+
+            # Close this repo's backend
+            try:
+                repo_backend.close()
+            except Exception:
+                pass
+
+        # Save registry
+        registry_path = get_registry_path(directory)
+        registry.save(registry_path)
+        console.print("\n[green]✓ Multi-repo indexing complete[/green]")
+        console.print(f"  Registry: {registry_path}")
+        total_files = sum(s.get("indexed_files", 0) for s in all_stats)
+        total_chunks = sum(s.get("total_chunks", 0) for s in all_stats)
+        console.print(f"  Total: {total_files} files, {total_chunks} chunks")
+        return
+
+    # --- Single-repo indexing (original flow) ---
 
     if update:
         console.print(f"[cyan]Incremental indexing {directory}...[/cyan]")
@@ -799,8 +910,18 @@ def search(
         console.print("[red]Error: --no-deps and --deps-only are mutually exclusive[/red]")
         sys.exit(1)
 
-    backend = create_backend(sia_dir, config, valid_chunks=valid_chunks)
-    backend.open_index()
+    # Multi-repo: if in workspace with registry, search all sub-repos
+    multi_backends = get_multi_repo_backends()
+    _multi_repo_mode = bool(multi_backends)
+    if _multi_repo_mode:
+        console.print(
+            f"[dim]Multi-repo: searching across {len(multi_backends)} repos[/dim]"
+        )
+        # Use primary backend for config-based settings; actual search aggregates all
+        backend = multi_backends[0][1]
+    else:
+        backend = create_backend(sia_dir, config, valid_chunks=valid_chunks)
+        backend.open_index()
 
     # Determine dependency filtering
     # Default: include deps (from config or True)
@@ -825,23 +946,41 @@ def search(
         console.print(f"[dim]Searching ({mode}{filter_status}{deps_status})...[/dim]")
 
     # Execute search based on mode
-    if regex:
-        results = backend.search_lexical(
-            query, k=limit, include_deps=include_deps, tier_boost=tier_boost
-        )
-    elif semantic_only:
-        results = backend.search_semantic(
-            query, k=limit, include_deps=include_deps, tier_boost=tier_boost
-        )
+    def _search_one_backend(be):
+        if regex:
+            return be.search_lexical(
+                query, k=limit, include_deps=include_deps, tier_boost=tier_boost
+            )
+        elif semantic_only:
+            return be.search_semantic(
+                query, k=limit, include_deps=include_deps, tier_boost=tier_boost
+            )
+        else:
+            return be.search_hybrid(
+                query,
+                k=limit,
+                vector_weight=config.search.vector_weight,
+                include_deps=include_deps,
+                tier_boost=tier_boost,
+            )
+
+    if _multi_repo_mode:
+        # Aggregate results from all repos
+        all_results = []
+        for repo_name, be in multi_backends:
+            try:
+                repo_results = _search_one_backend(be)
+                # Prefix file paths with repo name for disambiguation
+                for r in repo_results:
+                    if hasattr(r, "chunk") and hasattr(r.chunk, "file_path"):
+                        r.chunk.file_path = f"{repo_name}/{r.chunk.file_path}"
+                all_results.extend(repo_results)
+            except Exception:
+                pass
+        # Sort by score descending, take top `limit`
+        results = sorted(all_results, key=lambda r: r.score, reverse=True)[:limit]
     else:
-        # NEW: Hybrid search (BM25 + semantic) for best performance
-        results = backend.search_hybrid(
-            query,
-            k=limit,
-            vector_weight=config.search.vector_weight,
-            include_deps=include_deps,
-            tier_boost=tier_boost,
-        )
+        results = _search_one_backend(backend)
 
     # Filter for --deps-only after search
     if deps_only and results:

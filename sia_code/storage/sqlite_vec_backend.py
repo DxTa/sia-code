@@ -359,12 +359,27 @@ class SqliteVecBackend(StorageBackend):
             except Exception as e:
                 logger.debug(f"Embedding daemon not available: {e}")
 
+            # Auto-start daemon if not running (keeps model warm across repos)
+            if self._try_auto_start_daemon():
+                try:
+                    from ..embed_server.client import EmbedClient
+
+                    self._embedder = EmbedClient(model_name=self.embedding_model)
+                    logger.info(
+                        f"Auto-started embedding daemon for {self.embedding_model}"
+                    )
+                    return self._embedder
+                except Exception as e:
+                    logger.debug(f"Auto-started daemon not usable: {e}")
+
             # Fallback to local model (current behavior)
             from sentence_transformers import SentenceTransformer
             import torch
 
             # Auto-detect device (GPU if available, CPU fallback)
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
 
             self._embedder = SentenceTransformer(self.embedding_model, device=device)
 
@@ -372,6 +387,44 @@ class SqliteVecBackend(StorageBackend):
             logger.info(f"Loaded local {self.embedding_model} on {device.upper()}")
 
         return self._embedder
+
+    def _try_auto_start_daemon(self) -> bool:
+        """Auto-start embedding daemon in background if not running.
+
+        Returns True if daemon started successfully and is reachable.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        try:
+            from ..embed_server.client import EmbedClient
+            import subprocess
+            import sys
+            import time
+
+            logger.info("Auto-starting embedding daemon...")
+            # Start daemon as separate process (NOT in-process fork which calls sys.exit)
+            python_exe = sys.executable
+            subprocess.Popen(
+                [python_exe, "-c",
+                 "from sia_code.embed_server.daemon import start_daemon; "
+                 "start_daemon(foreground=True)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            # Wait for socket to become available (up to 10s for model load)
+            for _ in range(100):
+                if EmbedClient.is_available():
+                    return True
+                time.sleep(0.1)
+
+            logger.debug("Daemon started but socket not reachable within timeout")
+            return False
+        except Exception as e:
+            logger.debug(f"Failed to auto-start daemon: {e}")
+            return False
 
     def _get_thread_conn(self) -> sqlite3.Connection:
         """Get thread-local SQLite connection for parallel operations.
