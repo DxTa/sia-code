@@ -158,19 +158,20 @@ class EmbedDaemon:
 
             return self.models[model_name]
 
-    def _handle_embed(self, model: str, texts: list[str]) -> dict:
+    def _handle_embed(self, model: str, texts: list[str], batch_size: int = 32) -> dict:
         """Handle embedding request.
 
         Args:
             model: Model name
             texts: List of texts to embed
+            batch_size: Preferred batch size from client
 
         Returns:
             Response dict with embeddings
         """
         try:
             embedder = self._load_model(model)
-            vectors = embedder.encode(texts, convert_to_numpy=True, batch_size=32)
+            vectors = embedder.encode(texts, convert_to_numpy=True, batch_size=batch_size)
 
             return {
                 "embeddings": vectors.tolist(),
@@ -234,13 +235,14 @@ class EmbedDaemon:
                 params = request.get("params", {})
                 model = params.get("model")
                 texts = params.get("texts", [])
+                batch_size = int(params.get("batch_size", 32) or 32)
 
                 if not model or not texts:
                     response = ErrorResponse.create(
                         request_id, "Missing model or texts", "InvalidRequest"
                     )
                 else:
-                    result = self._handle_embed(model, texts)
+                    result = self._handle_embed(model, texts, batch_size=batch_size)
                     response = EmbedResponse.create(
                         request_id,
                         result["embeddings"],

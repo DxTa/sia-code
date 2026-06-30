@@ -19,6 +19,12 @@ from ..config import Config, RepoIndexOverride
 logger = logging.getLogger(__name__)
 
 
+def is_model_cached(model_name: str) -> bool:
+    """Return True if HuggingFace model appears cached locally."""
+    hub_name = model_name.replace('/', '--')
+    return (Path.home() / '.cache' / 'huggingface' / 'hub' / f'models--{hub_name}').exists()
+
+
 @dataclass
 class RepoEntry:
     """A registered sub-repo in a multi-repo workspace."""
@@ -255,16 +261,27 @@ def build_repo_config(base_config: Config, repo_name: str) -> Config:
                     merged_excludes.append(pattern)
         config.indexing.exclude_patterns = merged_excludes
 
-    # Profile-specific chunking for faster first-pass indexing.
-    # Heavy data-science / annotation repos benefit from fewer, larger chunks.
+    # Profile-specific chunking + embedding for faster first-pass indexing.
+    # Heavy data-science / annotation repos benefit from fewer, larger chunks
+    # plus a semantic budget and smaller embedding model when cached locally.
     if profile == "data_science":
         config.chunking.max_chunk_size = max(config.chunking.max_chunk_size, 1800)
         config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 120)
         config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.9)
+        config.embedding.granularity = "budget"
+        config.embedding.max_vectors_per_file = 16
+        if is_model_cached("BAAI/bge-small-en-v1.5"):
+            config.embedding.model = "BAAI/bge-small-en-v1.5"
+            config.embedding.dimensions = 384
     elif profile == "annotation_platform":
         config.chunking.max_chunk_size = max(config.chunking.max_chunk_size, 2200)
         config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 140)
         config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.92)
+        config.embedding.granularity = "budget"
+        config.embedding.max_vectors_per_file = 12
+        if is_model_cached("BAAI/bge-small-en-v1.5"):
+            config.embedding.model = "BAAI/bge-small-en-v1.5"
+            config.embedding.dimensions = 384
     return config
 
 
@@ -299,10 +316,16 @@ def estimate_indexable_files(directory: Path, config) -> int:
 
 
 def estimate_chunks(directory: Path, config: Config) -> int:
-    """Estimate chunk count for timeout sizing.
+    """Estimate raw chunk count for visibility / status."""
+    return estimate_semantic_vectors(directory, config, raw_chunks_only=True)
 
-    Uses real chunking against discovered files. This is cheap enough in practice
-    and much more accurate than file-count heuristics for monolithic repos.
+
+def estimate_semantic_vectors(
+    directory: Path, config: Config, raw_chunks_only: bool = False
+) -> int:
+    """Estimate semantic vectors to be embedded for timeout sizing.
+
+    In budget mode, this counts vectors after per-file cap is applied.
     """
     from ..core.types import Language
     from ..parser.chunker import CASTChunker
@@ -331,7 +354,11 @@ def estimate_chunks(directory: Path, config: Config) -> int:
             seen.add(file_path)
             try:
                 language = Language.from_extension(file_path.suffix)
-                total += len(chunker.chunk_file(file_path, language))
+                count = len(chunker.chunk_file(file_path, language))
+                if raw_chunks_only or config.embedding.granularity != "budget" or config.embedding.max_vectors_per_file <= 0:
+                    total += count
+                else:
+                    total += min(count, config.embedding.max_vectors_per_file)
             except Exception:
                 continue
     return total

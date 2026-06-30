@@ -73,12 +73,12 @@ class EmbedRequest:
     """Embedding request message."""
 
     @staticmethod
-    def create(request_id: str, model: str, texts: list[str]) -> dict:
+    def create(request_id: str, model: str, texts: list[str], batch_size: int = 32) -> dict:
         """Create embedding request."""
         return {
             "id": request_id,
             "method": "embed",
-            "params": {"model": model, "texts": texts},
+            "params": {"model": model, "texts": texts, "batch_size": batch_size},
         }
 
 

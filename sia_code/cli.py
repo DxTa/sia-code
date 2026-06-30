@@ -182,6 +182,10 @@ def create_backend(
         embedding_enabled=config.embedding.enabled,
         embedding_model=config.embedding.model,
         ndim=config.embedding.dimensions,
+        embedding_granularity=config.embedding.granularity,
+        max_vectors_per_file=config.embedding.max_vectors_per_file,
+        semantic_chunk_types=config.embedding.semantic_chunk_types,
+        persistent_embedding_cache=config.embedding.persistent_cache,
         valid_chunks=valid_chunks,
     )
 
@@ -562,6 +566,7 @@ def index(
         detect_sub_repos,
         estimate_chunks,
         estimate_indexable_files,
+        estimate_semantic_vectors,
         get_registry_path,
         is_multi_repo_workspace,
         recommend_repo_timeout_seconds,
@@ -610,17 +615,18 @@ def index(
 
             estimated_files = estimate_indexable_files(repo_path, repo_config)
             estimated_chunks = estimate_chunks(repo_path, repo_config)
+            estimated_vectors = estimate_semantic_vectors(repo_path, repo_config)
             repo_timeout = recommend_repo_timeout_seconds(
-                estimated_files, estimated_chunks
+                estimated_files, estimated_vectors
             )
-            is_heavy = estimated_chunks >= config.multi_repo.heavy_repo_chunk_threshold
+            is_heavy = estimated_vectors >= config.multi_repo.heavy_repo_chunk_threshold
 
             for entry in registry.repos:
                 if entry.name == repo_path.name:
                     entry.index_dir = str(
                         (workspace_sia / "repos" / repo_path.name).relative_to(directory)
                     )
-                    entry.estimated_chunks = estimated_chunks
+                    entry.estimated_chunks = estimated_vectors
                     entry.status = "pending"
                     entry.last_error = None
                     break
@@ -632,7 +638,8 @@ def index(
                     "repo_path": repo_path,
                     "repo_index_dir": repo_index_dir,
                     "estimated_files": estimated_files,
-                    "estimated_chunks": estimated_chunks,
+                    "estimated_chunks": estimated_vectors,
+                    "raw_chunks": estimated_chunks,
                     "repo_timeout": repo_timeout,
                     "heavy": is_heavy,
                 }
@@ -699,7 +706,7 @@ def index(
                 f"[cyan][{plan['seq']}/{len(sub_repos)}] Indexing {plan['repo_name']}...[/cyan]"
             )
             console.print(
-                f"    [dim]~{plan['estimated_files']} files, ~{plan['estimated_chunks']} chunks, timeout {plan['repo_timeout']}s{' [heavy]' if plan['heavy'] else ''}[/dim]"
+                f"    [dim]~{plan['estimated_files']} files, ~{plan['raw_chunks']} chunks, ~{plan['estimated_chunks']} vectors, timeout {plan['repo_timeout']}s{' [heavy]' if plan['heavy'] else ''}[/dim]"
             )
             for entry in registry.repos:
                 if entry.name == plan['repo_name']:

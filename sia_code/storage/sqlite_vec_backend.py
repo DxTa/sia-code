@@ -102,6 +102,10 @@ class SqliteVecBackend(StorageBackend):
         self.embedding_enabled = embedding_enabled
         self.embedding_model = embedding_model
         self.ndim = ndim
+        self.embedding_granularity = kwargs.pop("embedding_granularity", "chunk")
+        self.max_vectors_per_file = int(kwargs.pop("max_vectors_per_file", 0) or 0)
+        self.semantic_chunk_types = set(kwargs.pop("semantic_chunk_types", []) or [])
+        self.persistent_embedding_cache = bool(kwargs.pop("persistent_embedding_cache", True))
 
         # Paths
         self.db_path = self.path / "index.db"
@@ -121,6 +125,9 @@ class SqliteVecBackend(StorageBackend):
         # Search result cache
         self._search_cache: dict[str, list] | None = None
         self._search_cache_enabled = False
+
+        # Persistent embedding cache (global across repos/runs)
+        self._embedding_cache_conn: sqlite3.Connection | None = None
 
         self.mem = _MemoryAdapter(self)
 
@@ -278,22 +285,29 @@ class SqliteVecBackend(StorageBackend):
 
     def _vector_insert(self, vector_id: int, vector: np.ndarray) -> None:
         """Insert or replace a vector embedding."""
+        self._vector_insert_many([(vector_id, vector)])
+
+    def _vector_insert_many(self, items: list[tuple[int, np.ndarray]]) -> None:
+        """Bulk insert or replace vector embeddings."""
         if self.conn is None:
             raise RuntimeError("Database connection not initialized")
-        if not self.embedding_enabled:
+        if not self.embedding_enabled or not items:
             return
         self._ensure_vector_table()
-        payload = self._serialize_vector(vector)
         cursor = self.conn.cursor()
+        rows = [(vector_id, self._serialize_vector(vector)) for vector_id, vector in items]
         if self._using_vec_extension:
-            cursor.execute(
-                "INSERT OR REPLACE INTO vectors(rowid, embedding) VALUES (?, ?)",
-                (vector_id, payload),
-            )
+            # sqlite-vec virtual table path is safer with row-wise inserts.
+            # executemany + OR REPLACE can hit primary-key issues on some builds.
+            for row in rows:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO vectors(rowid, embedding) VALUES (?, ?)",
+                    row,
+                )
         else:
-            cursor.execute(
+            cursor.executemany(
                 "INSERT OR REPLACE INTO vectors(id, embedding) VALUES (?, ?)",
-                (vector_id, payload),
+                rows,
             )
 
     def _vector_search(self, query_vector: np.ndarray, k: int) -> list[tuple[str, float]]:
@@ -440,6 +454,88 @@ class SqliteVecBackend(StorageBackend):
             self._local.conn = conn
         return self._local.conn
 
+    def _get_embedding_cache_conn(self) -> sqlite3.Connection | None:
+        """Open persistent embedding cache DB shared across repos/runs."""
+        if not self.persistent_embedding_cache:
+            return None
+        if self._embedding_cache_conn is not None:
+            return self._embedding_cache_conn
+        try:
+            cache_dir = Path.home() / ".cache" / "sia-code"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_db = cache_dir / "embedding-cache.sqlite3"
+            conn = sqlite3.connect(cache_db)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embeddings_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_embeddings_cache_model ON embeddings_cache(model)"
+            )
+            conn.commit()
+            self._embedding_cache_conn = conn
+            return conn
+        except Exception:
+            return None
+
+    def _embedding_cache_key(self, text: str) -> str:
+        """Stable key for persistent embedding cache."""
+        import hashlib
+
+        return hashlib.sha256(f"{self.embedding_model}\0{text}".encode("utf-8")).hexdigest()
+
+    def _get_cached_embeddings(self, texts: list[str]) -> tuple[dict[int, np.ndarray], list[int], list[str]]:
+        """Return cached embeddings plus list of misses preserving order."""
+        conn = self._get_embedding_cache_conn()
+        if conn is None or not texts:
+            return {}, list(range(len(texts))), list(texts)
+
+        keys = [self._embedding_cache_key(t) for t in texts]
+        placeholders = ",".join("?" for _ in keys)
+        rows = conn.execute(
+            f"SELECT cache_key, embedding FROM embeddings_cache WHERE cache_key IN ({placeholders})",
+            keys,
+        ).fetchall()
+        cached = {
+            row[0]: np.frombuffer(row[1], dtype=np.float32).copy() for row in rows
+        }
+        hit_map: dict[int, np.ndarray] = {}
+        miss_idx: list[int] = []
+        miss_texts: list[str] = []
+        for i, key in enumerate(keys):
+            vec = cached.get(key)
+            if vec is None:
+                miss_idx.append(i)
+                miss_texts.append(texts[i])
+            else:
+                hit_map[i] = vec
+        return hit_map, miss_idx, miss_texts
+
+    def _put_cached_embeddings(self, texts: list[str], vectors: np.ndarray) -> None:
+        """Persist newly computed embeddings."""
+        conn = self._get_embedding_cache_conn()
+        if conn is None or not texts:
+            return
+        rows = [
+            (
+                self._embedding_cache_key(text),
+                self.embedding_model,
+                np.asarray(vec, dtype=np.float32).tobytes(),
+            )
+            for text, vec in zip(texts, vectors, strict=False)
+        ]
+        conn.executemany(
+            "INSERT OR REPLACE INTO embeddings_cache(cache_key, model, embedding) VALUES (?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+
     def _embed(self, text: str) -> np.ndarray | None:
         """Embed text to vector with caching.
 
@@ -526,26 +622,42 @@ class SqliteVecBackend(StorageBackend):
         if not texts:
             return np.empty((0, self.ndim), dtype=np.float32)
 
-        embedder = self._get_embedder()
-        batch_size = self._get_embed_batch_size()
-        encoded = []
+        # Persistent cache across runs/rebuilds
+        hit_map, miss_idx, miss_texts = self._get_cached_embeddings(texts)
+        out = np.empty((len(texts), self.ndim), dtype=np.float32)
+        for i, vec in hit_map.items():
+            out[i] = vec
 
-        # Process in batches to avoid memory spikes
-        for idx in range(0, len(texts), batch_size):
-            batch = texts[idx : idx + batch_size]
-            vectors = embedder.encode(
-                batch,
-                batch_size=batch_size,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-            )
-            encoded.append(np.asarray(vectors, dtype=np.float32))
+        if miss_texts:
+            batch_size = self._get_embed_batch_size()
+            encoded = []
+            for idx in range(0, len(miss_texts), batch_size):
+                batch = miss_texts[idx : idx + batch_size]
+                last_error = None
+                for attempt in range(2):
+                    embedder = self._get_embedder()
+                    try:
+                        vectors = embedder.encode(
+                            batch,
+                            batch_size=batch_size,
+                            show_progress_bar=False,
+                            convert_to_numpy=True,
+                        )
+                        encoded.append(np.asarray(vectors, dtype=np.float32))
+                        last_error = None
+                        break
+                    except Exception as e:
+                        last_error = e
+                        # Daemon may have died after availability check; force re-resolve once.
+                        self._embedder = None
+                if last_error is not None:
+                    raise last_error
+            new_vectors = encoded[0] if len(encoded) == 1 else np.vstack(encoded)
+            self._put_cached_embeddings(miss_texts, new_vectors)
+            for pos, vec in zip(miss_idx, new_vectors, strict=False):
+                out[pos] = vec
 
-        # Combine all batches
-        if len(encoded) == 1:
-            return encoded[0]
-        else:
-            return np.vstack(encoded)
+        return out
 
     def _make_chunk_key(self, chunk_id: int) -> str:
         """Create vector index key for chunk."""
@@ -658,6 +770,10 @@ class SqliteVecBackend(StorageBackend):
             self.conn.commit()
             self.conn.close()
             self.conn = None
+        if self._embedding_cache_conn is not None:
+            self._embedding_cache_conn.commit()
+            self._embedding_cache_conn.close()
+            self._embedding_cache_conn = None
 
     def seal(self) -> None:
         """Seal the index to finalize WAL and reduce storage.
@@ -892,6 +1008,36 @@ class SqliteVecBackend(StorageBackend):
     # Code Operations
     # ===================================================================
 
+    def _select_semantic_embedding_indices(self, chunks: list[Chunk]) -> list[int]:
+        """Select which chunks should receive semantic vectors.
+
+        All chunks are still stored lexically/FTS. This only reduces vector count
+        for heavy repo profiles.
+        """
+        if self.embedding_granularity != "budget" or self.max_vectors_per_file <= 0:
+            return list(range(len(chunks)))
+
+        allowed_types = self.semantic_chunk_types or {"class", "function", "method", "definition"}
+        by_file: dict[str, list[tuple[int, Chunk]]] = {}
+        for i, chunk in enumerate(chunks):
+            by_file.setdefault(str(chunk.file_path), []).append((i, chunk))
+
+        selected: list[int] = []
+        for items in by_file.values():
+            preferred = [
+                idx for idx, ch in items if getattr(ch.chunk_type, "value", str(ch.chunk_type)) in allowed_types
+            ]
+            fallback = [idx for idx, _ in items]
+            chosen = preferred[: self.max_vectors_per_file]
+            if len(chosen) < self.max_vectors_per_file:
+                for idx in fallback:
+                    if idx not in chosen:
+                        chosen.append(idx)
+                    if len(chosen) >= self.max_vectors_per_file:
+                        break
+            selected.extend(chosen)
+        return sorted(selected)
+
     def store_chunks_batch(self, chunks: list[Chunk]) -> list[str]:
         """Store multiple code chunks.
 
@@ -906,7 +1052,6 @@ class SqliteVecBackend(StorageBackend):
 
         cursor = self.conn.cursor()
         chunk_ids: list[int] = []
-        embed_texts: list[str] = []
 
         # Phase 1: preserve stable IDs on conflict without REPLACE row churn
         for chunk in chunks:
@@ -958,16 +1103,24 @@ class SqliteVecBackend(StorageBackend):
                 )
 
             chunk_ids.append(chunk_id)
-            embed_texts.append(f"{chunk.symbol}\n\n{chunk.code}")
 
-        # Phase 2: Batch-embed all chunks (inserted or updated)
+        # Phase 2: Batch-embed selected chunks only (all chunks remain lexically searchable)
         if self.embedding_enabled and chunk_ids:
             try:
-                vectors = self._embed_batch(embed_texts)
-
-                if vectors is not None:
-                    for j, chunk_id in enumerate(chunk_ids):
-                        self._vector_insert(int(chunk_id), vectors[j])
+                selected_indices = self._select_semantic_embedding_indices(chunks)
+                if selected_indices:
+                    embed_texts = [
+                        f"{chunks[idx].symbol}\n\n{chunks[idx].code}" for idx in selected_indices
+                    ]
+                    vectors = self._embed_batch(embed_texts)
+                    if vectors is not None:
+                        # Dedupe by chunk_id in case multiple chunks in the batch
+                        # resolve to the same stable URI/id.
+                        vector_map = {
+                            int(chunk_ids[idx]): vectors[pos]
+                            for pos, idx in enumerate(selected_indices)
+                        }
+                        self._vector_insert_many(list(vector_map.items()))
             except Exception:
                 # Rollback SQLite inserts to avoid chunks without embeddings
                 self.conn.rollback()

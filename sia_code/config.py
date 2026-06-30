@@ -73,6 +73,12 @@ class EmbeddingConfig(BaseModel):
     model: str = "BAAI/bge-base-en-v1.5"  # Model name (see supported models above)
     api_key_env: str = ""  # Deprecated legacy field; ignored by local-only runtime
     dimensions: int = 768  # Embedding dimensions (auto-detected for most models)
+    granularity: Literal["chunk", "budget"] = "chunk"
+    max_vectors_per_file: int = 0  # 0 = unlimited
+    semantic_chunk_types: list[str] = Field(
+        default_factory=lambda: ["class", "function", "method", "definition"]
+    )
+    persistent_cache: bool = True
 
 
 class IndexingConfig(BaseModel):
