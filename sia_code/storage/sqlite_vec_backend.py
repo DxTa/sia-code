@@ -1012,29 +1012,45 @@ class SqliteVecBackend(StorageBackend):
         """Select which chunks should receive semantic vectors.
 
         All chunks are still stored lexically/FTS. This only reduces vector count
-        for heavy repo profiles.
+        for heavy repo profiles. Selection is type-prioritized within each file.
         """
         if self.embedding_granularity != "budget" or self.max_vectors_per_file <= 0:
             return list(range(len(chunks)))
 
         allowed_types = self.semantic_chunk_types or {"class", "function", "method", "definition"}
+        type_priority = {
+            "class": 100,
+            "method": 95,
+            "function": 90,
+            "definition": 88,
+            "structure": 60,
+            "import": 45,
+            "block": 35,
+            "call": 25,
+            "docstring": 18,
+            "comment": 10,
+            "unknown": 5,
+        }
+
+        def _chunk_score(ch: Chunk) -> tuple[int, int, int, int]:
+            t = getattr(ch.chunk_type, "value", str(ch.chunk_type))
+            base = type_priority.get(t, 0)
+            if t in allowed_types:
+                base += 1000
+            symbol = (ch.symbol or "").lower()
+            if any(k in symbol for k in ("view", "viewset", "api", "handler", "endpoint", "trainer", "process", "service", "serializer", "model")):
+                base += 20
+            span = max(0, int(ch.end_line) - int(ch.start_line))
+            return (base, min(span, 400), 1 if ch.parent_header else 0, -int(ch.start_line))
+
         by_file: dict[str, list[tuple[int, Chunk]]] = {}
         for i, chunk in enumerate(chunks):
             by_file.setdefault(str(chunk.file_path), []).append((i, chunk))
 
         selected: list[int] = []
         for items in by_file.values():
-            preferred = [
-                idx for idx, ch in items if getattr(ch.chunk_type, "value", str(ch.chunk_type)) in allowed_types
-            ]
-            fallback = [idx for idx, _ in items]
-            chosen = preferred[: self.max_vectors_per_file]
-            if len(chosen) < self.max_vectors_per_file:
-                for idx in fallback:
-                    if idx not in chosen:
-                        chosen.append(idx)
-                    if len(chosen) >= self.max_vectors_per_file:
-                        break
+            ranked = sorted(items, key=lambda it: _chunk_score(it[1]), reverse=True)
+            chosen = [idx for idx, _ in ranked[: self.max_vectors_per_file]]
             selected.extend(chosen)
         return sorted(selected)
 

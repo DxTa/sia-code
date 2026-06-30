@@ -500,6 +500,27 @@ class TestAdaptiveSearch:
         first_query = calls[0]
         assert "how" not in first_query.lower() or "main" in first_query.lower()
 
+    def test_uses_hybrid_variants_when_budgeted_embeddings_enabled(self, backend, sample_chunks):
+        """Budgeted indexes should seed research via multiple hybrid query variants."""
+        backend.store_chunks_batch(sample_chunks)
+        backend.embedding_enabled = True
+        backend.embedding_granularity = "budget"
+
+        original_search_hybrid = backend.search_hybrid
+        calls = []
+
+        def mock_search_hybrid(query, *args, **kwargs):
+            calls.append(query)
+            return original_search_hybrid(query, *args, **kwargs)
+
+        backend.search_hybrid = mock_search_hybrid
+
+        strategy = MultiHopSearchStrategy(backend, max_hops=1)
+        strategy.research("How does load_config work in main flow?", max_results_per_hop=5)
+
+        assert len(calls) >= 2
+        assert any("load_config" in q for q in calls)
+
 
 class TestNaturalLanguageQueries:
     """Test that research handles natural language questions."""

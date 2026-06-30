@@ -106,6 +106,103 @@ class QueryPreprocessor:
         # Rejoin with spaces
         return " ".join(keywords)
 
+    def expand_variants(self, question: str) -> list[str]:
+        """Produce 2-3 query variants for research seeding.
+
+        Variants aim to improve recall for code search by combining:
+        - raw natural language
+        - cleaned keyword query
+        - synthesized code-like identifiers / framework-role forms
+        """
+        if not question or not question.strip():
+            return []
+
+        variants: list[str] = []
+        raw = question.strip()
+        variants.append(raw)
+
+        keywords = self.extract_keywords(question)
+        keyword_query = " ".join(keywords)
+        if keyword_query and keyword_query.lower() != raw.lower():
+            variants.append(keyword_query)
+
+        focused_parts: list[str] = []
+        identifiers = [t for t in keywords if self._is_code_identifier(t)]
+        plain = [t for t in keywords if not self._is_code_identifier(t)]
+        focused_parts.extend(identifiers[:4])
+        focused_parts.extend(self._synthesize_code_forms(keywords))
+        focused_parts.extend([t for t in plain if len(t) >= 4 and t.lower() not in {'work', 'works'}][:4])
+        focused = " ".join(dict.fromkeys(p for p in focused_parts if p)).strip()
+        if focused and focused.lower() not in {v.lower() for v in variants}:
+            variants.append(focused)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for v in variants:
+            key = v.lower().strip()
+            if key and key not in seen:
+                deduped.append(v)
+                seen.add(key)
+        return deduped[:3]
+
+    def _synthesize_code_forms(self, tokens: list[str]) -> list[str]:
+        """Generate code-like identifier variants from plain-language tokens.
+
+        Examples:
+        - stable diffusion trainer -> StableDiffusionTrainer, stable_diffusion_trainer
+        - task rest api -> TaskViewSet, TaskSerializer, TaskAPIView
+        """
+        if not tokens:
+            return []
+
+        lowered = [t.lower() for t in tokens]
+        generic_noise = {'work', 'works', 'working'}
+        results: list[str] = []
+
+        role_terms = {
+            "trainer": "Trainer",
+            "config": "Config",
+            "service": "Service",
+            "manager": "Manager",
+            "controller": "Controller",
+            "model": "Model",
+            "serializer": "Serializer",
+            "viewset": "ViewSet",
+            "handler": "Handler",
+            "pipeline": "Pipeline",
+        }
+
+        role_idx = next((i for i, t in enumerate(lowered) if t in role_terms), None)
+        if role_idx is not None and role_idx > 0:
+            base_tokens = lowered[: role_idx + 1]
+            camel = "".join(t.capitalize() for t in base_tokens)
+            snake = "_".join(base_tokens)
+            results.extend([camel, snake])
+
+        # API-ish expansion: task REST API -> TaskViewSet / TaskSerializer / TaskAPIView
+        api_tokens = {"api", "rest", "endpoint"}
+        if any(t in api_tokens for t in lowered):
+            base = next((t for t in lowered if t not in api_tokens and t not in generic_noise and len(t) > 2), None)
+            if base:
+                title = base.capitalize()
+                results.extend([f"{title}ViewSet", f"{title}Serializer", f"{title}APIView"])
+
+        # Generic multi-token camel/snake for first 2-3 meaningful words
+        content = [t for t in lowered if len(t) > 2 and t not in api_tokens and t not in generic_noise][:3]
+        if len(content) >= 2:
+            results.append("".join(t.capitalize() for t in content))
+            results.append("_".join(content))
+
+        # Keep small and unique
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in results:
+            k = r.lower()
+            if r and k not in seen:
+                out.append(r)
+                seen.add(k)
+        return out[:6]
+
     def extract_keywords(self, question: str) -> list[str]:
         """Extract meaningful keywords from a question.
 
