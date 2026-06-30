@@ -499,13 +499,15 @@ class SqliteVecBackend(StorageBackend):
             mem_based = 16
         elif mem_gb < 24:
             mem_based = 32
+        elif mem_gb < 48:
+            mem_based = 96
         else:
-            mem_based = 64
+            mem_based = 128
 
         cpu_count = os.cpu_count() or 2
         max_by_cpu = max(8, cpu_count * 8)
         size = min(mem_based, max_by_cpu)
-        size = max(8, min(64, size))
+        size = max(8, min(128, size))
 
         self._embed_batch_size = int(size)
         return self._embed_batch_size

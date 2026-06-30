@@ -366,23 +366,35 @@ def get_multi_repo_backends(cwd: Path | None = None):
     Returns:
         list of (repo_name, backend) tuples, or empty list if not multi-repo
     """
-    from .storage.multi_repo import get_registry_path, MultiRepoRegistry
+    from .storage.multi_repo import MultiRepoRegistry, get_registry_path
 
     workspace = cwd or Path.cwd()
     registry_path = get_registry_path(workspace)
     registry = MultiRepoRegistry.load(registry_path)
-    if not registry or not registry.repos:
-        return []
+
+    entries = []
+    if registry and registry.repos:
+        entries = [(entry.name, workspace / entry.index_dir) for entry in registry.repos]
+    else:
+        # Fallback: infer from workspace-level repos dir even if registry missing/interrupted
+        repos_root = workspace / ".sia-code" / "repos"
+        if repos_root.exists():
+            entries = [
+                (child.name, child)
+                for child in sorted(repos_root.iterdir())
+                if child.is_dir() and (child / "index.db").exists()
+            ]
+        if not entries:
+            return []
 
     backends = []
-    for entry in registry.repos:
-        repo_sia_dir = workspace / entry.index_dir
+    for repo_name, repo_sia_dir in entries:
         if (repo_sia_dir / "index.db").exists():
             try:
                 config = Config.load(repo_sia_dir / "config.json")
                 backend = create_backend(repo_sia_dir, config, suppress_stdout_notices=True)
                 backend.open_index()
-                backends.append((entry.name, backend))
+                backends.append((repo_name, backend))
             except Exception:
                 pass
     return backends
@@ -545,10 +557,12 @@ def index(
 
     # Auto-detect multi-repo workspace (multiple git sub-repos)
     from .storage.multi_repo import (
-        detect_sub_repos,
-        is_multi_repo_workspace,
         build_registry,
+        detect_sub_repos,
+        estimate_indexable_files,
         get_registry_path,
+        is_multi_repo_workspace,
+        recommend_repo_timeout_seconds,
     )
 
     if is_multi_repo_workspace(directory):
@@ -565,6 +579,8 @@ def index(
         registry = build_registry(directory, sub_repos)
         all_stats = []
         workspace_sia = directory / ".sia-code"
+        registry_path = get_registry_path(directory)
+        registry.save(registry_path)
 
         # Pre-warm embed daemon (shared across all repos)
         try:
@@ -603,7 +619,14 @@ def index(
                     )
                     break
 
-            # Index in subprocess (crash-isolated, 5 min timeout per repo)
+            # Estimate size for timeout sizing and visibility
+            estimated_files = estimate_indexable_files(repo_path, config)
+            repo_timeout = recommend_repo_timeout_seconds(estimated_files)
+            console.print(
+                f"    [dim]~{estimated_files} files, timeout {repo_timeout}s[/dim]"
+            )
+
+            # Index in subprocess (crash-isolated, dynamic timeout per repo)
             clean_flag = "True" if clean else "False"
             index_script = (
                 "import sys, json, os\n"
@@ -634,8 +657,9 @@ def index(
             try:
                 result = _sp.run(
                     [sys.executable, "-c", index_script],
-                    capture_output=True, text=True,
-                    timeout=300,
+                    capture_output=True,
+                    text=True,
+                    timeout=repo_timeout,
                 )
                 _elapsed = _time.monotonic() - _t0
                 if result.returncode == 0:
@@ -651,6 +675,7 @@ def index(
                             entry.indexed_at = datetime.now(timezone.utc).isoformat()
                             entry.file_count = stats.get("indexed_files", 0)
                             break
+                    registry.save(registry_path)
                     console.print(
                         f"    [green]✓[/green] {stats.get('indexed_files', 0)} files, "
                         f"{stats.get('total_chunks', 0)} chunks "
@@ -665,13 +690,12 @@ def index(
             except _sp.TimeoutExpired:
                 _elapsed = _time.monotonic() - _t0
                 console.print(
-                    f"    [yellow]⚠ Timeout ({_elapsed:.0f}s) — skipped[/yellow]"
+                    f"    [yellow]⚠ Timeout ({_elapsed:.0f}s/{repo_timeout}s) — skipped[/yellow]"
                 )
             except Exception as e:
                 console.print(f"    [red]✗ Failed: {e}[/red]")
 
         # Save registry
-        registry_path = get_registry_path(directory)
         registry.save(registry_path)
         console.print("\n[green]✓ Multi-repo indexing complete[/green]")
         console.print(f"  Registry: {registry_path}")
@@ -1388,6 +1412,39 @@ def status():
     from .indexer.chunk_index import ChunkIndex
 
     sia_dir, config = require_initialized()
+
+    # Multi-repo aggregate status
+    multi_backends = get_multi_repo_backends()
+    if multi_backends:
+        total_files = 0
+        total_chunks = 0
+        repo_rows = []
+        for repo_name, backend in multi_backends:
+            try:
+                stats = backend.get_stats()
+                total_files += stats.total_files
+                total_chunks += stats.total_chunks
+                repo_rows.append((repo_name, stats.total_files, stats.total_chunks))
+            except Exception:
+                pass
+
+        table = Table(title="Sia Code Index Status (Multi-Repo)")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Workspace Index Path", str(sia_dir))
+        table.add_row("Registered Repos", f"{len(multi_backends):,}")
+        table.add_row("Total Files", f"{total_files:,}")
+        table.add_row("Total Chunks", f"{total_chunks:,}")
+        console.print(table)
+
+        repo_table = Table(title="Per-Repo Status")
+        repo_table.add_column("Repo", style="cyan")
+        repo_table.add_column("Files", justify="right")
+        repo_table.add_column("Chunks", justify="right")
+        for repo_name, files_n, chunks_n in repo_rows:
+            repo_table.add_row(repo_name, f"{files_n:,}", f"{chunks_n:,}")
+        console.print(repo_table)
+        return
 
     backend = create_backend(sia_dir, config)
     backend.open_index()

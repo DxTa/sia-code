@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pathspec
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,3 +134,45 @@ def build_registry(workspace_root: Path, repos: list[Path]) -> MultiRepoRegistry
         created_at=datetime.now(timezone.utc).isoformat(),
         repos=entries,
     )
+
+
+def estimate_indexable_files(directory: Path, config) -> int:
+    """Estimate how many files will be indexed for timeout sizing.
+
+    Mirrors IndexingCoordinator._discover_files() but counts only.
+    """
+    effective_patterns = config.indexing.get_effective_exclude_patterns(directory)
+    spec = pathspec.PathSpec.from_lines("gitwildmatch", effective_patterns)
+
+    count = 0
+    seen: set[Path] = set()
+    max_bytes = config.indexing.max_file_size_mb * 1024 * 1024
+    for pattern in config.indexing.include_patterns:
+        glob_pattern = pattern if "*" in pattern else f"**/*{pattern}"
+        for file_path in directory.rglob(glob_pattern):
+            if not file_path.is_file() or file_path in seen:
+                continue
+            rel_path = file_path.relative_to(directory)
+            if spec.match_file(str(rel_path)):
+                continue
+            try:
+                file_size = file_path.stat().st_size
+            except OSError:
+                continue
+            if file_size == 0 or file_size > max_bytes:
+                continue
+            seen.add(file_path)
+            count += 1
+    return count
+
+
+def recommend_repo_timeout_seconds(file_count: int) -> int:
+    """Compute per-repo timeout from estimated file count.
+
+    Small repos keep 5m floor. Large repos scale up but stay bounded.
+    """
+    if file_count <= 0:
+        return 300
+    # ~0.8s per file plus 60s overhead, bounded 5m..30m
+    seconds = int(60 + file_count * 0.8)
+    return max(300, min(1800, seconds))
