@@ -323,7 +323,7 @@ class SqliteVecBackend(StorageBackend):
         if not rows:
             return []
 
-        query = np.asarray(query_vector, dtype=np.float32)
+        query = np.asarray(query_vector, dtype=np.float32).flatten()
         query_norm = np.linalg.norm(query) or 1.0
         scored = []
         for row in rows:

@@ -564,10 +564,23 @@ def index(
         registry = build_registry(directory, sub_repos)
         all_stats = []
 
+        # Pre-warm embed daemon before the loop (shared across all repos)
+        try:
+            backend_tmp = create_backend(
+                directory / ".sia-code", config, suppress_stdout_notices=True
+            )
+            backend_tmp._get_embedder()  # triggers auto-start daemon
+            console.print("[dim]Embedding daemon ready[/dim]")
+        except Exception:
+            pass
+
+        import time as _time
+
         for i, repo_path in enumerate(sub_repos, 1):
             console.print(
                 f"[cyan][{i}/{len(sub_repos)}] Indexing {repo_path.name}...[/cyan]"
             )
+            _t0 = _time.monotonic()
             repo_sia_dir = repo_path / ".sia-code"
             repo_sia_dir.mkdir(parents=True, exist_ok=True)
 
@@ -601,9 +614,11 @@ def index(
                         )
                         entry.file_count = stats.get("indexed_files", 0)
                         break
+                _elapsed = _time.monotonic() - _t0
                 console.print(
                     f"    [green]✓[/green] {stats.get('indexed_files', 0)} files, "
-                    f"{stats.get('total_chunks', 0)} chunks"
+                    f"{stats.get('total_chunks', 0)} chunks "
+                    f"[dim]({_elapsed:.1f}s)[/dim]"
                 )
             except Exception as e:
                 console.print(f"    [red]✗ Failed: {e}[/red]")
