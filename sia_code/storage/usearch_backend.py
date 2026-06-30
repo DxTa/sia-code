@@ -4,10 +4,17 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
-from usearch.index import Index, MetricKind
+
+# IMPORTANT: usearch must NOT be imported at module level.
+# On Python 3.13 + macOS ARM64, importing usearch before
+# sentence_transformers.encode() causes a segfault due to
+# a shared-library symbol conflict. We lazy-import usearch
+# only when needed and ensure the embedder is loaded first.
+if TYPE_CHECKING:
+    from usearch.index import Index
 
 from ..core.models import (
     ChangelogEntry,
@@ -22,6 +29,17 @@ from ..core.models import (
 from ..core.types import ChunkType, Language
 from .base import StorageBackend
 from .sqlite_runtime import connect_sqlite
+
+
+def _lazy_usearch():
+    """Lazy-import usearch to avoid segfault on macOS ARM64 + Python 3.13.
+    
+    The usearch native extension conflicts with tokenizers/torch when imported
+    before SentenceTransformer.encode(). By deferring the import, we ensure
+    the embedding model initializes safely first.
+    """
+    from usearch.index import Index, MetricKind
+    return Index, MetricKind
 
 
 class _MemoryAdapter:
@@ -116,7 +134,7 @@ class UsearchSqliteBackend(StorageBackend):
         self.db_path = self.path / "index.db"
 
         # Will be initialized in create_index() or open_index()
-        self.vector_index: Index | None = None
+        self.vector_index: "Index | None" = None
         self.conn: sqlite3.Connection | None = None
         self._embedder = None  # Lazy-loaded embedding model
 
@@ -436,7 +454,13 @@ class UsearchSqliteBackend(StorageBackend):
         """Create a new index (vectors + SQLite)."""
         self.path.mkdir(parents=True, exist_ok=True)
 
-        # Create usearch vector index
+        # Pre-initialize embedder BEFORE importing usearch to avoid segfault
+        # on Python 3.13 + macOS ARM64 (shared-library symbol conflict).
+        if self.embedding_enabled:
+            self._get_embedder()
+
+        # Create usearch vector index (lazy import to avoid segfault)
+        Index, MetricKind = _lazy_usearch()
         self.vector_index = Index(
             ndim=self.ndim,
             metric=MetricKind.Cos if self.metric == "cos" else MetricKind.L2sq,
@@ -462,7 +486,13 @@ class UsearchSqliteBackend(StorageBackend):
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {self.db_path}")
 
+        # Pre-initialize embedder BEFORE importing usearch to avoid segfault
+        # on Python 3.13 + macOS ARM64 (shared-library symbol conflict).
+        if self.embedding_enabled:
+            self._get_embedder()
+
         # Load usearch index (memory-mapped for fast access when read-only)
+        Index, MetricKind = _lazy_usearch()
         self.vector_index = Index(ndim=self.ndim, metric=MetricKind.Cos, dtype=self.dtype)
         # Only view if the file is not empty
         if self.vector_path.stat().st_size > 0:
