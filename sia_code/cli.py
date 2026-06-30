@@ -1132,14 +1132,26 @@ def search(
     if _multi_repo_mode:
         # Aggregate results from all repos
         all_results = []
+        from dataclasses import replace
+        from pathlib import Path as _Path
+
         for repo_name, be in multi_backends:
             try:
                 repo_results = _search_one_backend(be)
-                # Prefix file paths with repo name for disambiguation
+                rewritten = []
+                repo_root = Path.cwd() / repo_name
                 for r in repo_results:
-                    if hasattr(r, "chunk") and hasattr(r.chunk, "file_path"):
-                        r.chunk.file_path = f"{repo_name}/{r.chunk.file_path}"
-                all_results.extend(repo_results)
+                    try:
+                        orig_path = Path(r.chunk.file_path)
+                        rel_path = orig_path.relative_to(repo_root) if orig_path.is_absolute() else orig_path
+                    except Exception:
+                        rel_path = Path(r.chunk.file_path).name
+                    new_chunk = replace(
+                        r.chunk,
+                        file_path=_Path(repo_name) / rel_path,
+                    )
+                    rewritten.append(replace(r, chunk=new_chunk))
+                all_results.extend(rewritten)
             except Exception:
                 pass
         # Sort by score descending, take top `limit`
@@ -1429,20 +1441,65 @@ def research(question: str, hops: int, graph: bool, limit: int, no_filter: bool)
             except Exception:
                 pass  # Silently fall back to no filtering
 
-    backend = create_backend(sia_dir, config, valid_chunks=valid_chunks)
-    backend.open_index()
-
-    strategy = MultiHopSearchStrategy(backend, max_hops=hops)
-
+    multi_backends = get_multi_repo_backends()
     console.print(f"[dim]Researching: {question}[/dim]")
     console.print(f"[dim]Max hops: {hops}, Results per hop: {limit}[/dim]\n")
 
-    with Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
-    ) as progress:
-        task = progress.add_task("Analyzing code relationships...", total=None)
-        result = strategy.research(question, max_results_per_hop=limit)
-        progress.update(task, completed=True)
+    if multi_backends:
+        from dataclasses import replace
+        from pathlib import Path as _Path
+
+        combined_chunks = []
+        combined_relationships = []
+        max_hops_executed = 0
+        total_entities_found = 0
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+        ) as progress:
+            task = progress.add_task("Analyzing code relationships across repos...", total=None)
+            for repo_name, backend in multi_backends:
+                try:
+                    strategy = MultiHopSearchStrategy(backend, max_hops=hops)
+                    repo_result = strategy.research(question, max_results_per_hop=limit)
+                    if repo_result.chunks:
+                        repo_root = Path.cwd() / repo_name
+                        rewritten_chunks = []
+                        for chunk in repo_result.chunks:
+                            try:
+                                orig_path = Path(chunk.file_path)
+                                rel_path = orig_path.relative_to(repo_root) if orig_path.is_absolute() else orig_path
+                            except Exception:
+                                rel_path = Path(chunk.file_path).name
+                            rewritten_chunks.append(
+                                replace(chunk, file_path=_Path(repo_name) / rel_path)
+                            )
+                        combined_chunks.extend(rewritten_chunks)
+                        combined_relationships.extend(repo_result.relationships)
+                        max_hops_executed = max(max_hops_executed, repo_result.hops_executed)
+                        total_entities_found += repo_result.total_entities_found
+                except Exception:
+                    pass
+            progress.update(task, completed=True)
+
+        from .search.multi_hop import ResearchResult
+        result = ResearchResult(
+            question=question,
+            chunks=combined_chunks[: max(10, limit * 4)],
+            relationships=combined_relationships,
+            hops_executed=max_hops_executed,
+            total_entities_found=total_entities_found,
+        )
+    else:
+        backend = create_backend(sia_dir, config, valid_chunks=valid_chunks)
+        backend.open_index()
+        strategy = MultiHopSearchStrategy(backend, max_hops=hops)
+
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+        ) as progress:
+            task = progress.add_task("Analyzing code relationships...", total=None)
+            result = strategy.research(question, max_results_per_hop=limit)
+            progress.update(task, completed=True)
 
     # Display results summary
     console.print("\n[bold green]✓ Research Complete[/bold green]")

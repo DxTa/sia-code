@@ -62,11 +62,16 @@ class MultiHopSearchStrategy:
         """
         if self.backend.embedding_enabled:
             try:
+                granularity = getattr(self.backend, "embedding_granularity", "chunk")
+                if granularity == "budget":
+                    logger.info(f"Using hybrid search for budgeted index query: {question[:100]}")
+                    return self.backend.search_hybrid(question, k=k, vector_weight=0.35)
+
                 logger.info(f"Using semantic search for query: {question[:100]}")
                 return self.backend.search_semantic(question, k=k)
             except Exception as e:
                 logger.warning(
-                    f"Semantic search failed ({e.__class__.__name__}: {str(e)}), "
+                    f"Semantic/hybrid search failed ({e.__class__.__name__}: {str(e)}), "
                     "falling back to lexical search"
                 )
                 # Fall through to lexical search
