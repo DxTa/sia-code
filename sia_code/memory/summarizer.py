@@ -100,7 +100,45 @@ class CommitSummarizer:
             logger.warning(f"Error during summarization: {e}")
             return None
 
-    def enhance_changelog(self, tag: str, original_summary: str, commits: list[str]) -> str:
+    def generate(self, prompt: str, max_length: int = 150, num_beams: int = 1) -> Optional[str]:
+        """General-purpose generation with custom prompt.
+
+        Used by DiffSemanticAnalyzer for narrative rewriting.
+        Supports greedy (num_beams=1) for speed or beam search for quality.
+
+        Args:
+            prompt: Input prompt text.
+            max_length: Maximum output tokens.
+            num_beams: Beam width (1 = greedy, fast; 4 = beam search, better quality).
+
+        Returns:
+            Generated text, or None if model unavailable.
+        """
+        self._load_model()
+        if self._model is None or self._tokenizer is None:
+            return None
+
+        try:
+            inputs = self._tokenizer(
+                prompt, return_tensors="pt", max_length=512, truncation=True
+            )
+            device = next(self._model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            outputs = self._model.generate(
+                **inputs, max_length=max_length, num_beams=num_beams,
+                early_stopping=(num_beams > 1),
+            )
+            result = self._tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return result.strip() if result.strip() else None
+
+        except Exception as e:
+            logger.debug(f"Generation failed: {e}")
+            return None
+
+    def enhance_changelog(
+        self, tag: str, original_summary: str, commits: list[str]
+    ) -> str:
         """Enhance a sparse changelog entry with commit details.
 
         Args:

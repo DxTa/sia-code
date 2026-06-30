@@ -183,6 +183,21 @@ class SummarizationConfig(BaseModel):
     max_commits: int = 20  # Max commits to include in summary
 
 
+class GitDynamicConfig(BaseModel):
+    """Configuration for dynamic git memory system."""
+
+    enabled: bool = True
+    lookback_commits: int = 200
+    coupling_threshold: float = 0.3
+    max_files_per_commit: int = 20  # squash dilution guard
+    working_window_days: int = 14
+    recency_halflife_days: float = 30.0
+    base_branch: str = "main"
+    cross_branch_enabled: bool = True
+    semantic_weight: float = 0.3  # in combined score: git=0.7, semantic=0.3
+    narrative_model: str | None = None  # None = auto-select (large on 16GB+, base otherwise)
+
+
 class StorageConfig(BaseModel):
     """Storage backend selection configuration."""
 
@@ -204,6 +219,7 @@ class Config(BaseModel):
     adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
     summarization: SummarizationConfig = Field(default_factory=SummarizationConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    git_dynamic: GitDynamicConfig = Field(default_factory=GitDynamicConfig)
 
     @classmethod
     def load(cls, path: Path) -> "Config":

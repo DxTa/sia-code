@@ -2398,5 +2398,185 @@ def embed_status(verbose):
         console.print("\n[dim]Start with: sia-code embed start[/dim]")
 
 
+# ---------------------------------------------------------------------------
+# Dynamic Git Memory CLI Commands (consolidated)
+# ---------------------------------------------------------------------------
+
+
+@memory.command(name="git-context")
+@click.argument("file_paths", nargs=-1, required=True)
+@click.option("--no-blast-radius", is_flag=True, help="Skip blast radius analysis")
+@click.option("--no-narrative", is_flag=True, help="Skip evolution narrative")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+)
+def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format):
+    """Show git context for files: history, blast radius, and evolution narrative.
+
+    Combines file history (revert-aware, cross-branch, recency-scored),
+    co-change blast radius, and model-generated evolution narrative.
+    Auto-uses local flan-t5 model for narrative when available.
+
+    Examples:
+        sia-code memory git-context src/api/datasample.py
+        sia-code memory git-context src/api.py src/crud.py --format json
+        sia-code memory git-context src/api.py --no-narrative
+    """
+    from .config import Config
+    from .memory.blast_radius import BlastRadiusAnalyzer
+    from .memory.diff_analyzer import DiffSemanticAnalyzer
+    from .memory.git_dynamic import GitDynamicMemory
+    from .memory.intent_classifier import IntentClassifier
+    from .memory.recency import RecencyConfig
+
+    project_dir = Path.cwd()
+    config = Config.load(project_dir / ".sia-code" / "config.json")
+    gc = config.git_dynamic
+
+    recency_cfg = RecencyConfig(
+        halflife_days=gc.recency_halflife_days,
+        working_window_days=gc.working_window_days,
+    )
+    mem = GitDynamicMemory(project_dir, recency_config=recency_cfg)
+    classifier = IntentClassifier()
+
+    all_results = {}
+    for fp in file_paths:
+        hist = mem.file_history(fp, cross_branch=gc.cross_branch_enabled, limit=15)
+        if not hist.effective_commits:
+            console.print(f"[yellow]No history found for {fp}[/yellow]")
+            continue
+
+        # Classify intents
+        for c in hist.effective_commits:
+            intent = classifier.classify(c.message, len(c.files_changed), c.insertions + c.deletions)
+            c.intent = intent.intent
+
+        entry = {"hist": hist, "radius": None, "narrative": None}
+
+        # Blast radius
+        if not no_blast_radius:
+            analyzer = BlastRadiusAnalyzer(
+                project_dir,
+                lookback=gc.lookback_commits,
+                min_coupling=gc.coupling_threshold,
+                max_files_per_commit=gc.max_files_per_commit,
+                recency_config=recency_cfg,
+            )
+            entry["radius"] = analyzer.co_changed_files(fp)
+
+        # Narrative
+        if not no_narrative:
+            try:
+                diff_analyzer = DiffSemanticAnalyzer(project_dir, model_name=gc.narrative_model)
+                entry["narrative"] = diff_analyzer.summarize_evolution(hist)
+            except Exception:
+                pass
+
+        all_results[fp] = entry
+
+    if not all_results:
+        console.print("[red]No results found.[/red]")
+        return
+
+    if output_format == "json":
+        import json
+
+        data = {}
+        for fp, entry in all_results.items():
+            hist = entry["hist"]
+            d = {
+                "branch_context": {
+                    "current": hist.branch_context.current_branch if hist.branch_context else None,
+                    "base": hist.branch_context.base_branch if hist.branch_context else None,
+                },
+                "owners": hist.owners[:3],
+                "reverts": [
+                    {"reverted": r.reverted_hash[:7], "by": r.reverting_hash[:7]}
+                    for r in hist.reverts
+                ],
+                "commits": [
+                    {
+                        "hash": c.hash[:7],
+                        "message": c.message,
+                        "intent": c.intent,
+                        "recency": round(c.recency_score, 3),
+                        "author": c.author,
+                    }
+                    for c in hist.effective_commits[:10]
+                ],
+            }
+            if entry["radius"]:
+                d["blast_radius"] = [
+                    {"path": cf.path, "coupling": round(cf.coupling_score, 3)}
+                    for cf in entry["radius"].coupled_files[:10]
+                ]
+            if entry["narrative"]:
+                d["narrative"] = entry["narrative"].narrative
+                d["phases"] = entry["narrative"].key_phases
+                d["model_used"] = entry["narrative"].model_used
+            data[fp] = d
+        console.print(json.dumps(data, indent=2))
+    else:
+        # Table format
+        for fp, entry in all_results.items():
+            hist = entry["hist"]
+            console.print(f"\n[bold]{'='*60}[/bold]")
+            console.print(f"[bold]File:[/bold] {fp}")
+            if hist.branch_context:
+                ctx = hist.branch_context
+                console.print(
+                    f"  Branch: {ctx.current_branch} | Base: {ctx.base_branch}"
+                )
+            if hist.owners:
+                owners_str = ", ".join(f"{a} ({n})" for a, n in hist.owners[:3])
+                console.print(f"  Owners: {owners_str}")
+            if hist.reverts:
+                console.print(f"  [yellow]Reverts: {len(hist.reverts)}[/yellow]")
+                for r in hist.reverts:
+                    console.print(f"    {r.reverting_hash[:7]} reverts {r.reverted_hash[:7]}")
+
+            # Narrative
+            if entry["narrative"]:
+                n = entry["narrative"]
+                model_tag = f" [dim](via {n.model_used})[/dim]" if n.model_used else " [dim](heuristic)[/dim]"
+                console.print(f"\n  [bold]Evolution:[/bold]{model_tag}")
+                console.print(f"  {n.narrative}")
+                if n.key_phases:
+                    console.print(f"  Phases: {', '.join(n.key_phases)}")
+
+            # Commits
+            console.print(f"\n  [bold]History[/bold] ({len(hist.effective_commits)} effective):")
+            for c in hist.effective_commits[:8]:
+                intent_tag = f"[{c.intent}]" if c.intent else ""
+                console.print(
+                    f"    [{c.recency_score:.2f}] {c.hash[:7]} {c.message[:55]} "
+                    f"[dim]{c.author} {intent_tag}[/dim]"
+                )
+
+            # Blast radius
+            if entry["radius"] and entry["radius"].coupled_files:
+                radius = entry["radius"]
+                console.print(
+                    f"\n  [bold]Blast Radius[/bold] "
+                    f"({radius.total_commits_analyzed} commits, "
+                    f"{radius.commits_excluded_squash} squash-excluded):"
+                )
+                for cf in radius.coupled_files[:8]:
+                    bar = "█" * int(cf.coupling_score * 20)
+                    console.print(
+                        f"    [{cf.coupling_score:.2f}] {bar:20s} {cf.path}"
+                    )
+                if radius.change_clusters:
+                    for cl in radius.change_clusters:
+                        console.print(
+                            f"    [dim]Cluster (cohesion {cl.cohesion_score:.2f}): "
+                            f"{', '.join(cl.files)}[/dim]"
+                        )
+
+
 if __name__ == "__main__":
     main()
