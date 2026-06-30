@@ -246,10 +246,25 @@ def get_repo_override(config: Config, repo_name: str) -> RepoIndexOverride | Non
 
 
 def build_repo_config(base_config: Config, repo_name: str) -> Config:
-    """Clone config and apply repo-specific override for faster indexing."""
+    """Clone config and apply fast indexing policy by default.
+
+    Baseline fast policy applies to any repo, then known profiles add stronger
+    tuning and repo-specific include/exclude overrides.
+    """
     config = base_config.model_copy(deep=True)
     profile = get_repo_profile(repo_name)
     override = get_repo_override(config, repo_name)
+
+    # Baseline fast policy for ALL repos.
+    config.chunking.max_chunk_size = max(config.chunking.max_chunk_size, 1400)
+    config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 80)
+    config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.85)
+    config.embedding.granularity = "budget"
+    if config.embedding.max_vectors_per_file <= 0:
+        config.embedding.max_vectors_per_file = 32
+    else:
+        config.embedding.max_vectors_per_file = min(config.embedding.max_vectors_per_file, 32)
+
     if override:
         if override.index_first:
             config.indexing.include_patterns = override.index_first
@@ -268,7 +283,6 @@ def build_repo_config(base_config: Config, repo_name: str) -> Config:
         config.chunking.max_chunk_size = max(config.chunking.max_chunk_size, 1800)
         config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 120)
         config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.9)
-        config.embedding.granularity = "budget"
         config.embedding.max_vectors_per_file = 24
         if is_model_cached("BAAI/bge-small-en-v1.5"):
             config.embedding.model = "BAAI/bge-small-en-v1.5"
@@ -277,7 +291,6 @@ def build_repo_config(base_config: Config, repo_name: str) -> Config:
         config.chunking.max_chunk_size = max(config.chunking.max_chunk_size, 2200)
         config.chunking.min_chunk_size = max(config.chunking.min_chunk_size, 140)
         config.chunking.merge_threshold = max(config.chunking.merge_threshold, 0.92)
-        config.embedding.granularity = "budget"
         config.embedding.max_vectors_per_file = 16
         if is_model_cached("BAAI/bge-small-en-v1.5"):
             config.embedding.model = "BAAI/bge-small-en-v1.5"
