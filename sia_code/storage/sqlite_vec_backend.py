@@ -246,9 +246,11 @@ class SqliteVecBackend(StorageBackend):
             import logging
 
             logger = logging.getLogger(__name__)
-            logger.warning(
-                "sqlite-vec extension not available; falling back to brute-force vector search."
-            )
+            if not getattr(SqliteVecBackend, "_sqlite_vec_warned", False):
+                logger.warning(
+                    "sqlite-vec extension not available; falling back to brute-force vector search."
+                )
+                SqliteVecBackend._sqlite_vec_warned = True
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS vectors (

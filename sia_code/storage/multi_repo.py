@@ -124,7 +124,7 @@ def build_registry(workspace_root: Path, repos: list[Path]) -> MultiRepoRegistry
             RepoEntry(
                 name=repo_path.name,
                 path=rel_path,
-                index_dir=f"{rel_path}/.sia-code",
+                index_dir=f".sia-code/repos/{repo_path.name}",
             )
         )
     return MultiRepoRegistry(

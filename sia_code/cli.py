@@ -561,73 +561,114 @@ def index(
         console.print()
 
         # Fan-out: index each repo independently
+        # All indexes stored under workspace .sia-code/repos/<name>/ (no pollution in sub-repos)
         registry = build_registry(directory, sub_repos)
         all_stats = []
+        workspace_sia = directory / ".sia-code"
 
-        # Pre-warm embed daemon before the loop (shared across all repos)
+        # Pre-warm embed daemon (shared across all repos)
         try:
             backend_tmp = create_backend(
-                directory / ".sia-code", config, suppress_stdout_notices=True
+                workspace_sia, config, suppress_stdout_notices=True
             )
-            backend_tmp._get_embedder()  # triggers auto-start daemon
+            backend_tmp._get_embedder()
             console.print("[dim]Embedding daemon ready[/dim]")
         except Exception:
             pass
 
         import time as _time
+        import subprocess as _sp
+        import json as _json
 
         for i, repo_path in enumerate(sub_repos, 1):
             console.print(
                 f"[cyan][{i}/{len(sub_repos)}] Indexing {repo_path.name}...[/cyan]"
             )
             _t0 = _time.monotonic()
-            repo_sia_dir = repo_path / ".sia-code"
-            repo_sia_dir.mkdir(parents=True, exist_ok=True)
 
-            # Write minimal config if none exists
-            repo_config_path = repo_sia_dir / "config.json"
+            # Store index under workspace: .sia-code/repos/<name>/
+            repo_index_dir = workspace_sia / "repos" / repo_path.name
+            repo_index_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write config for this sub-index
+            repo_config_path = repo_index_dir / "config.json"
             if not repo_config_path.exists():
                 config.save(repo_config_path)
 
-            # Create backend for this repo
-            repo_backend = create_backend(repo_sia_dir, config)
-            if clean:
-                index_path = repo_sia_dir / "index.db"
-                if index_path.exists():
-                    index_path.unlink()
-                repo_backend.create_index()
-            else:
-                try:
-                    repo_backend.open_index()
-                except Exception:
-                    repo_backend.create_index()
+            # Update registry to point to workspace-level index dir
+            for entry in registry.repos:
+                if entry.name == repo_path.name:
+                    entry.index_dir = str(
+                        (workspace_sia / "repos" / repo_path.name).relative_to(directory)
+                    )
+                    break
 
-            repo_coord = IndexingCoordinator(config, repo_backend)
+            # Index in subprocess (crash-isolated, 5 min timeout per repo)
+            clean_flag = "True" if clean else "False"
+            index_script = (
+                "import sys, json, os\n"
+                "os.environ.setdefault('HF_HUB_OFFLINE', '1')\n"
+                "from pathlib import Path\n"
+                "from sia_code.config import Config\n"
+                "from sia_code.cli import create_backend\n"
+                "from sia_code.indexer.coordinator import IndexingCoordinator\n"
+                f"sia_dir = Path({str(repo_index_dir)!r})\n"
+                f"repo_dir = Path({str(repo_path)!r})\n"
+                f"do_clean = {clean_flag}\n"
+                "config = Config.load(sia_dir / 'config.json')\n"
+                "backend = create_backend(sia_dir, config, suppress_stdout_notices=True)\n"
+                "if do_clean:\n"
+                "    idx = sia_dir / 'index.db'\n"
+                "    if idx.exists(): idx.unlink()\n"
+                "    backend.create_index()\n"
+                "else:\n"
+                "    try:\n"
+                "        backend.open_index()\n"
+                "    except Exception:\n"
+                "        backend.create_index()\n"
+                "coord = IndexingCoordinator(config, backend)\n"
+                "stats = coord.index_directory(repo_dir)\n"
+                "backend.close()\n"
+                "print(json.dumps(stats))\n"
+            )
             try:
-                stats = repo_coord.index_directory(repo_path)
-                all_stats.append(stats)
-                # Update registry entry
-                for entry in registry.repos:
-                    if entry.name == repo_path.name:
-                        entry.indexed_at = (
-                            datetime.now(timezone.utc).isoformat()
-                        )
-                        entry.file_count = stats.get("indexed_files", 0)
-                        break
+                result = _sp.run(
+                    [sys.executable, "-c", index_script],
+                    capture_output=True, text=True,
+                    timeout=300,
+                )
+                _elapsed = _time.monotonic() - _t0
+                if result.returncode == 0:
+                    stdout_lines = result.stdout.strip().splitlines()
+                    stats_line = stdout_lines[-1] if stdout_lines else '{}'
+                    try:
+                        stats = _json.loads(stats_line)
+                    except _json.JSONDecodeError:
+                        stats = {"indexed_files": 0, "total_chunks": 0}
+                    all_stats.append(stats)
+                    for entry in registry.repos:
+                        if entry.name == repo_path.name:
+                            entry.indexed_at = datetime.now(timezone.utc).isoformat()
+                            entry.file_count = stats.get("indexed_files", 0)
+                            break
+                    console.print(
+                        f"    [green]✓[/green] {stats.get('indexed_files', 0)} files, "
+                        f"{stats.get('total_chunks', 0)} chunks "
+                        f"[dim]({_elapsed:.1f}s)[/dim]"
+                    )
+                else:
+                    err_lines = result.stderr.strip().splitlines()
+                    err_msg = err_lines[-1][:80] if err_lines else "unknown"
+                    console.print(
+                        f"    [red]✗ Failed ({_elapsed:.1f}s): {err_msg}[/red]"
+                    )
+            except _sp.TimeoutExpired:
                 _elapsed = _time.monotonic() - _t0
                 console.print(
-                    f"    [green]✓[/green] {stats.get('indexed_files', 0)} files, "
-                    f"{stats.get('total_chunks', 0)} chunks "
-                    f"[dim]({_elapsed:.1f}s)[/dim]"
+                    f"    [yellow]⚠ Timeout ({_elapsed:.0f}s) — skipped[/yellow]"
                 )
             except Exception as e:
                 console.print(f"    [red]✗ Failed: {e}[/red]")
-
-            # Close this repo's backend
-            try:
-                repo_backend.close()
-            except Exception:
-                pass
 
         # Save registry
         registry_path = get_registry_path(directory)
@@ -636,7 +677,7 @@ def index(
         console.print(f"  Registry: {registry_path}")
         total_files = sum(s.get("indexed_files", 0) for s in all_stats)
         total_chunks = sum(s.get("total_chunks", 0) for s in all_stats)
-        console.print(f"  Total: {total_files} files, {total_chunks} chunks")
+        console.print(f"  Total: {total_files} files, {total_chunks} chunks across {len(all_stats)} repos")
         return
 
     # --- Single-repo indexing (original flow) ---
