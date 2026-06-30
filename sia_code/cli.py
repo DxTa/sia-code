@@ -597,48 +597,49 @@ def index(
         import time as _time
         import subprocess as _sp
         import json as _json
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        plans = []
         for i, repo_path in enumerate(sub_repos, 1):
-            console.print(
-                f"[cyan][{i}/{len(sub_repos)}] Indexing {repo_path.name}...[/cyan]"
-            )
-            _t0 = _time.monotonic()
-
-            # Store index under workspace: .sia-code/repos/<name>/
             repo_index_dir = workspace_sia / "repos" / repo_path.name
             repo_index_dir.mkdir(parents=True, exist_ok=True)
 
-            # Build per-repo config override and persist for this sub-index
             repo_config = build_repo_config(config, repo_path.name)
             repo_config_path = repo_index_dir / "config.json"
             repo_config.save(repo_config_path)
 
-            # Update registry to point to workspace-level index dir
-            for entry in registry.repos:
-                if entry.name == repo_path.name:
-                    entry.index_dir = str(
-                        (workspace_sia / "repos" / repo_path.name).relative_to(directory)
-                    )
-                    break
-
-            # Estimate size for timeout sizing and visibility
             estimated_files = estimate_indexable_files(repo_path, repo_config)
             estimated_chunks = estimate_chunks(repo_path, repo_config)
             repo_timeout = recommend_repo_timeout_seconds(
                 estimated_files, estimated_chunks
             )
-            console.print(
-                f"    [dim]~{estimated_files} files, ~{estimated_chunks} chunks, timeout {repo_timeout}s[/dim]"
-            )
+            is_heavy = estimated_chunks >= config.multi_repo.heavy_repo_chunk_threshold
+
             for entry in registry.repos:
                 if entry.name == repo_path.name:
+                    entry.index_dir = str(
+                        (workspace_sia / "repos" / repo_path.name).relative_to(directory)
+                    )
                     entry.estimated_chunks = estimated_chunks
-                    entry.status = "indexing"
+                    entry.status = "pending"
                     entry.last_error = None
                     break
-            registry.save(registry_path)
 
-            # Index in subprocess (crash-isolated, dynamic timeout per repo)
+            plans.append(
+                {
+                    "seq": i,
+                    "repo_name": repo_path.name,
+                    "repo_path": repo_path,
+                    "repo_index_dir": repo_index_dir,
+                    "estimated_files": estimated_files,
+                    "estimated_chunks": estimated_chunks,
+                    "repo_timeout": repo_timeout,
+                    "heavy": is_heavy,
+                }
+            )
+        registry.save(registry_path)
+
+        def _run_repo_plan(plan: dict) -> dict:
             clean_flag = "True" if clean else "False"
             index_script = (
                 "import sys, json, os\n"
@@ -647,8 +648,8 @@ def index(
                 "from sia_code.config import Config\n"
                 "from sia_code.cli import create_backend\n"
                 "from sia_code.indexer.coordinator import IndexingCoordinator\n"
-                f"sia_dir = Path({str(repo_index_dir)!r})\n"
-                f"repo_dir = Path({str(repo_path)!r})\n"
+                f"sia_dir = Path({str(plan['repo_index_dir'])!r})\n"
+                f"repo_dir = Path({str(plan['repo_path'])!r})\n"
                 f"do_clean = {clean_flag}\n"
                 "config = Config.load(sia_dir / 'config.json')\n"
                 "backend = create_backend(sia_dir, config, suppress_stdout_notices=True)\n"
@@ -666,14 +667,15 @@ def index(
                 "backend.close()\n"
                 "print(json.dumps(stats))\n"
             )
+            t0 = _time.monotonic()
             try:
                 result = _sp.run(
                     [sys.executable, "-c", index_script],
                     capture_output=True,
                     text=True,
-                    timeout=repo_timeout,
+                    timeout=plan["repo_timeout"],
                 )
-                _elapsed = _time.monotonic() - _t0
+                elapsed = _time.monotonic() - t0
                 if result.returncode == 0:
                     stdout_lines = result.stdout.strip().splitlines()
                     stats_line = stdout_lines[-1] if stdout_lines else '{}'
@@ -681,51 +683,95 @@ def index(
                         stats = _json.loads(stats_line)
                     except _json.JSONDecodeError:
                         stats = {"indexed_files": 0, "total_chunks": 0}
-                    all_stats.append(stats)
-                    for entry in registry.repos:
-                        if entry.name == repo_path.name:
-                            entry.indexed_at = datetime.now(timezone.utc).isoformat()
-                            entry.file_count = stats.get("indexed_files", 0)
-                            entry.status = "full"
-                            entry.last_error = None
-                            break
-                    registry.save(registry_path)
-                    console.print(
-                        f"    [green]✓[/green] {stats.get('indexed_files', 0)} files, "
-                        f"{stats.get('total_chunks', 0)} chunks "
-                        f"[dim]({_elapsed:.1f}s)[/dim]"
-                    )
-                else:
-                    err_lines = result.stderr.strip().splitlines()
-                    err_msg = err_lines[-1][:120] if err_lines else "unknown"
-                    for entry in registry.repos:
-                        if entry.name == repo_path.name:
-                            entry.status = "failed"
-                            entry.last_error = err_msg
-                            break
-                    registry.save(registry_path)
-                    console.print(
-                        f"    [red]✗ Failed ({_elapsed:.1f}s): {err_msg}[/red]"
-                    )
+                    return {"kind": "ok", "plan": plan, "elapsed": elapsed, "stats": stats}
+                err_lines = result.stderr.strip().splitlines()
+                err_msg = err_lines[-1][:120] if err_lines else "unknown"
+                return {"kind": "failed", "plan": plan, "elapsed": elapsed, "error": err_msg}
             except _sp.TimeoutExpired:
-                _elapsed = _time.monotonic() - _t0
+                elapsed = _time.monotonic() - t0
+                return {"kind": "timed_out", "plan": plan, "elapsed": elapsed, "error": f"timeout after {plan['repo_timeout']}s"}
+            except Exception as e:
+                elapsed = _time.monotonic() - t0
+                return {"kind": "failed", "plan": plan, "elapsed": elapsed, "error": str(e)[:120]}
+
+        def _mark_started(plan: dict):
+            console.print(
+                f"[cyan][{plan['seq']}/{len(sub_repos)}] Indexing {plan['repo_name']}...[/cyan]"
+            )
+            console.print(
+                f"    [dim]~{plan['estimated_files']} files, ~{plan['estimated_chunks']} chunks, timeout {plan['repo_timeout']}s{' [heavy]' if plan['heavy'] else ''}[/dim]"
+            )
+            for entry in registry.repos:
+                if entry.name == plan['repo_name']:
+                    entry.status = 'indexing'
+                    entry.last_error = None
+                    break
+            registry.save(registry_path)
+
+        def _record_result(result: dict):
+            plan = result['plan']
+            if result['kind'] == 'ok':
+                stats = result['stats']
+                all_stats.append(stats)
                 for entry in registry.repos:
-                    if entry.name == repo_path.name:
-                        entry.status = "timed_out"
-                        entry.last_error = f"timeout after {repo_timeout}s"
+                    if entry.name == plan['repo_name']:
+                        entry.indexed_at = datetime.now(timezone.utc).isoformat()
+                        entry.file_count = stats.get('indexed_files', 0)
+                        entry.status = 'full'
+                        entry.last_error = None
                         break
                 registry.save(registry_path)
                 console.print(
-                    f"    [yellow]⚠ Timeout ({_elapsed:.0f}s/{repo_timeout}s) — skipped[/yellow]"
+                    f"    [green]✓[/green] {stats.get('indexed_files', 0)} files, {stats.get('total_chunks', 0)} chunks [dim]({result['elapsed']:.1f}s)[/dim]"
                 )
-            except Exception as e:
+            elif result['kind'] == 'timed_out':
                 for entry in registry.repos:
-                    if entry.name == repo_path.name:
-                        entry.status = "failed"
-                        entry.last_error = str(e)[:120]
+                    if entry.name == plan['repo_name']:
+                        entry.status = 'timed_out'
+                        entry.last_error = result['error']
                         break
                 registry.save(registry_path)
-                console.print(f"    [red]✗ Failed: {e}[/red]")
+                console.print(
+                    f"    [yellow]⚠ Timeout ({result['elapsed']:.0f}s/{plan['repo_timeout']}s) — skipped[/yellow]"
+                )
+            else:
+                for entry in registry.repos:
+                    if entry.name == plan['repo_name']:
+                        entry.status = 'failed'
+                        entry.last_error = result['error']
+                        break
+                registry.save(registry_path)
+                console.print(
+                    f"    [red]✗ Failed ({result['elapsed']:.1f}s): {result['error']}[/red]"
+                )
+
+        concurrency = max(1, int(config.multi_repo.fanout_concurrency))
+        batch: list[dict] = []
+        def _flush_batch(batch_plans: list[dict]):
+            if not batch_plans:
+                return
+            if len(batch_plans) == 1:
+                _mark_started(batch_plans[0])
+                _record_result(_run_repo_plan(batch_plans[0]))
+                return
+            for p in batch_plans:
+                _mark_started(p)
+            with ThreadPoolExecutor(max_workers=min(concurrency, len(batch_plans))) as ex:
+                futs = [ex.submit(_run_repo_plan, p) for p in batch_plans]
+                for fut in as_completed(futs):
+                    _record_result(fut.result())
+
+        for plan in plans:
+            if plan['heavy']:
+                _flush_batch(batch)
+                batch = []
+                _flush_batch([plan])
+            else:
+                batch.append(plan)
+                if len(batch) >= concurrency:
+                    _flush_batch(batch)
+                    batch = []
+        _flush_batch(batch)
 
         # Save registry
         registry.save(registry_path)

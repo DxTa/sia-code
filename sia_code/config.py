@@ -211,7 +211,7 @@ class MultiRepoConfig(BaseModel):
     """Workspace-level multi-repo indexing controls."""
 
     enabled: bool = True
-    fanout_concurrency: int = 1
+    fanout_concurrency: int = 2
     heavy_repo_chunk_threshold: int = 4000
     heavy_repo_run_dependency_tier: bool = False
     repo_overrides: dict[str, RepoIndexOverride] = Field(default_factory=dict)
