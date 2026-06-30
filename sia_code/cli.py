@@ -1515,6 +1515,7 @@ def status():
                 repo_rows.append(
                     (
                         repo_name,
+                        meta.profile if meta else "general",
                         status_value,
                         meta.estimated_chunks if meta else 0,
                         stats.total_files,
@@ -1529,6 +1530,7 @@ def status():
                 repo_rows.append(
                     (
                         repo_name,
+                        meta.profile if meta else "general",
                         status_value,
                         meta.estimated_chunks if meta else 0,
                         0,
@@ -1544,6 +1546,7 @@ def status():
                     repo_rows.append(
                         (
                             entry.name,
+                            entry.profile,
                             entry.status,
                             entry.estimated_chunks,
                             0,
@@ -1569,14 +1572,16 @@ def status():
 
         repo_table = Table(title="Per-Repo Status")
         repo_table.add_column("Repo", style="cyan")
+        repo_table.add_column("Profile")
         repo_table.add_column("State")
         repo_table.add_column("Est Chunks", justify="right")
         repo_table.add_column("Files", justify="right")
         repo_table.add_column("Chunks", justify="right")
         repo_table.add_column("Last Error", overflow="fold")
-        for repo_name, state, est_chunks, files_n, chunks_n, last_error in sorted(repo_rows):
+        for repo_name, profile, state, est_chunks, files_n, chunks_n, last_error in sorted(repo_rows):
             repo_table.add_row(
                 repo_name,
+                profile,
                 state,
                 f"{est_chunks:,}" if est_chunks else "-",
                 f"{files_n:,}",

@@ -26,6 +26,7 @@ class RepoEntry:
     name: str
     path: str  # relative to workspace root
     index_dir: str  # relative path to .sia-code/ dir
+    profile: str = "general"
     indexed_at: str | None = None
     file_count: int = 0
     estimated_chunks: int = 0
@@ -52,6 +53,7 @@ class MultiRepoRegistry:
                     "name": r.name,
                     "path": r.path,
                     "index_dir": r.index_dir,
+                    "profile": r.profile,
                     "indexed_at": r.indexed_at,
                     "file_count": r.file_count,
                     "estimated_chunks": r.estimated_chunks,
@@ -78,6 +80,7 @@ class MultiRepoRegistry:
                         name=r["name"],
                         path=r["path"],
                         index_dir=r["index_dir"],
+                        profile=r.get("profile", "general"),
                         indexed_at=r.get("indexed_at"),
                         file_count=r.get("file_count", 0),
                         estimated_chunks=r.get("estimated_chunks", 0),
@@ -128,6 +131,15 @@ def get_registry_path(workspace_root: Path) -> Path:
     return workspace_root / ".sia-code" / "multi-repo.json"
 
 
+def get_repo_profile(repo_name: str) -> str:
+    """Classify known repo families for indexing-aware policy decisions."""
+    if repo_name == "ai.platform.forks.ai-toolkit":
+        return "data_science"
+    if repo_name == "ai.platform.annotation-suite.cvat":
+        return "annotation_platform"
+    return "general"
+
+
 def build_registry(workspace_root: Path, repos: list[Path]) -> MultiRepoRegistry:
     """Build a fresh registry from detected repos."""
     entries = []
@@ -138,6 +150,7 @@ def build_registry(workspace_root: Path, repos: list[Path]) -> MultiRepoRegistry
                 name=repo_path.name,
                 path=rel_path,
                 index_dir=f".sia-code/repos/{repo_path.name}",
+                profile=get_repo_profile(repo_path.name),
             )
         )
     return MultiRepoRegistry(
@@ -185,6 +198,42 @@ def get_repo_override(config: Config, repo_name: str) -> RepoIndexOverride | Non
                 "toolkit/keymaps/**",
                 ".github/**",
                 ".vscode/**",
+            ],
+        )
+
+    if repo_name == "ai.platform.annotation-suite.cvat":
+        return RepoIndexOverride(
+            index_first=[
+                "cvat/apps/**",
+                "cvat/settings/**",
+                "cvat/utils/**",
+                "cvat-core/src/**",
+                "cvat-canvas/src/**",
+                "cvat-canvas3d/src/**",
+                "cvat-data/src/**",
+                "cvat-ui/src/**",
+                "cvat-sdk/cvat_sdk/**",
+            ],
+            dependency_tier=[
+                "serverless/**",
+                "utils/**",
+                "cvat-cli/**",
+            ],
+            lazy_index=[
+                "tests/**",
+                "**/tests/**",
+                "site/**",
+                "helm-chart/**",
+                "ai-models/**",
+                "backend_entrypoint.d/**",
+                "changelog.d/**",
+            ],
+            skip=[
+                "cvat-ui/dist/**",
+                "cvat-sdk/gen/**",
+                ".github/**",
+                ".vscode/**",
+                ".regal/**",
             ],
         )
     return None
