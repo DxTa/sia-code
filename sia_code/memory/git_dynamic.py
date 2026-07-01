@@ -138,14 +138,15 @@ class BranchResolver:
         return short or "unknown"
 
     def resolve_base_branch(self) -> str:
-        """Find the actual base branch (main/master/develop)."""
-        # Check configured base first
+        """Find the actual base branch (main/master/develop), local or remote."""
         candidates = [self.config.base_branch] + self.config.base_branch_fallbacks
         for branch in candidates:
-            check = self._git("rev-parse", "--verify", f"refs/heads/{branch}", check=False)
-            if check:
+            local_check = self._git("rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+            if local_check:
                 return branch
-        # Fallback: first branch that isn't current
+            remote_check = self._git("rev-parse", "--verify", f"refs/remotes/origin/{branch}", check=False)
+            if remote_check:
+                return f"origin/{branch}"
         current = self.current_branch()
         branches = self.all_branch_names()
         for b in branches:

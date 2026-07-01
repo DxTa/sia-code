@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..storage.multi_repo import is_model_cached
+
 if TYPE_CHECKING:
     from .git_dynamic import FileHistory, HistoricalCommit
 
@@ -90,12 +92,11 @@ class DiffSemanticAnalyzer:
         self._summarizer = None
 
     def _can_use_model(self) -> bool:
-        """Cheap import check — auto-opt-in."""
+        """Only use model when transformers is importable AND weights are cached."""
         if not self._model_checked:
             try:
                 import transformers  # noqa: F401
-
-                self._can_model = True
+                self._can_model = is_model_cached(self._get_model_name())
             except ImportError:
                 self._can_model = False
             self._model_checked = True

@@ -141,6 +141,7 @@ class SearchConfig(BaseModel):
     default_limit: int = 10
     multi_hop_enabled: bool = True
     max_hops: int = 2
+    flan_query_rewrite: bool = False  # optional, cached-only FLAN extra rewrite candidate
     vector_weight: float = (
         0.7  # Weight for vector search in hybrid (0.0=lexical only, 1.0=semantic only)
     )

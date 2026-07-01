@@ -270,7 +270,10 @@ def build_repo_config(base_config: Config, repo_name: str) -> Config:
             config.indexing.include_patterns = override.index_first
 
         merged_excludes = list(config.indexing.exclude_patterns)
-        for group in (override.dependency_tier, override.lazy_index, override.skip):
+        exclude_groups = [override.lazy_index, override.skip]
+        if not config.multi_repo.heavy_repo_run_dependency_tier:
+            exclude_groups.insert(0, override.dependency_tier)
+        for group in exclude_groups:
             for pattern in group:
                 if pattern not in merged_excludes:
                     merged_excludes.append(pattern)

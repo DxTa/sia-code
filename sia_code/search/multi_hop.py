@@ -50,32 +50,42 @@ class MultiHopSearchStrategy:
         self.extractor = EntityExtractor()
         self._preprocessor = QueryPreprocessor()  # Cache instance to avoid recreation
 
-    def _aggregate_seed_results(self, result_sets: list[list[SearchResult]], k: int) -> list[SearchResult]:
+    def _aggregate_seed_results(
+        self, result_sets: list[list[SearchResult]], k: int
+    ) -> list[SearchResult]:
         """Merge result sets from multiple query variants.
 
-        Uses chunk identity when available, otherwise file/symbol/line tuple.
-        Rewards repeated hits modestly without overwhelming score scales.
+        Uses retrieval evidence to rank variants implicitly:
+        - better scores win
+        - repeated hits across variants get a modest boost
+        - earlier ranks contribute slightly more than later ranks
         """
-        merged: dict[str, tuple[SearchResult, float, int]] = {}
+        merged: dict[str, tuple[SearchResult, float, int, float]] = {}
         for results in result_sets:
-            for r in results:
-                key = str(r.chunk.id) if r.chunk.id else f"{r.chunk.file_path}:{r.chunk.symbol}:{r.chunk.start_line}:{r.chunk.end_line}"
+            for rank, r in enumerate(results, start=1):
+                key = (
+                    str(r.chunk.id)
+                    if r.chunk.id
+                    else f"{r.chunk.file_path}:{r.chunk.symbol}:{r.chunk.start_line}:{r.chunk.end_line}"
+                )
+                rank_bonus = 0.05 / rank
                 if key in merged:
-                    base, best_score, hits = merged[key]
-                    merged[key] = (base, max(best_score, r.score), hits + 1)
+                    base, best_score, hits, bonus = merged[key]
+                    merged[key] = (base, max(best_score, r.score), hits + 1, bonus + rank_bonus)
                 else:
-                    merged[key] = (r, r.score, 1)
+                    merged[key] = (r, r.score, 1, rank_bonus)
 
         ranked: list[SearchResult] = []
-        for base, best_score, hits in merged.values():
-            combined = best_score + (0.03 * (hits - 1))
+        for base, best_score, hits, bonus in merged.values():
+            combined = best_score + (0.03 * (hits - 1)) + bonus
             ranked.append(replace(base, score=combined))
         ranked.sort(key=lambda x: x.score, reverse=True)
         return ranked[:k]
 
     def _initial_search(self, question: str, k: int) -> list:
         """Perform initial search with adaptive mode selection and query rewrites."""
-        variants = self._preprocessor.expand_variants(question)
+        allow_model = bool(getattr(self.backend, "flan_query_rewrite", False))
+        variants = self._preprocessor.expand_variants(question, allow_model=allow_model)
         if not variants:
             variants = [question]
 

@@ -3,6 +3,10 @@
 import re
 from typing import Set
 
+from ..storage.multi_repo import is_model_cached
+
+_FLAN_REWRITE_SUMMARIZER = None
+
 
 class QueryPreprocessor:
     """Preprocess natural language queries for lexical search.
@@ -106,13 +110,14 @@ class QueryPreprocessor:
         # Rejoin with spaces
         return " ".join(keywords)
 
-    def expand_variants(self, question: str) -> list[str]:
-        """Produce 2-3 query variants for research seeding.
+    def expand_variants(self, question: str, allow_model: bool = False) -> list[str]:
+        """Produce 2-4 query variants for research seeding.
 
-        Variants aim to improve recall for code search by combining:
+        Variants combine:
         - raw natural language
         - cleaned keyword query
         - synthesized code-like identifiers / framework-role forms
+        - optional cached-FLAN rewrite candidate
         """
         if not question or not question.strip():
             return []
@@ -136,6 +141,11 @@ class QueryPreprocessor:
         if focused and focused.lower() not in {v.lower() for v in variants}:
             variants.append(focused)
 
+        if allow_model:
+            flan_variant = self._generate_flan_variant(question, keywords)
+            if flan_variant and flan_variant.lower() not in {v.lower() for v in variants}:
+                variants.append(flan_variant)
+
         deduped: list[str] = []
         seen: set[str] = set()
         for v in variants:
@@ -143,7 +153,7 @@ class QueryPreprocessor:
             if key and key not in seen:
                 deduped.append(v)
                 seen.add(key)
-        return deduped[:3]
+        return deduped[:4]
 
     def _synthesize_code_forms(self, tokens: list[str]) -> list[str]:
         """Generate code-like identifier variants from plain-language tokens.
@@ -202,6 +212,39 @@ class QueryPreprocessor:
                 out.append(r)
                 seen.add(k)
         return out[:6]
+
+    def _generate_flan_variant(self, question: str, keywords: list[str]) -> str | None:
+        """Optionally generate one concise code-search rewrite using cached FLAN.
+
+        Never downloads models. Returns None if FLAN base not cached or transformers unavailable.
+        """
+        model_name = 'google/flan-t5-base'
+        if not is_model_cached(model_name):
+            return None
+        # Only worth it for natural-language questions, not direct symbol lookups
+        if sum(1 for t in keywords if not self._is_code_identifier(t)) < 2:
+            return None
+        try:
+            from ..memory.summarizer import CommitSummarizer
+
+            prompt = (
+                'Rewrite this software engineering question into a concise code search query. '
+                'Keep likely identifiers, components, API names, and configuration terms. '
+                'Do not answer the question.\n\n'
+                f'Question: {question}\n'
+                'Query:'
+            )
+            global _FLAN_REWRITE_SUMMARIZER
+            if _FLAN_REWRITE_SUMMARIZER is None:
+                _FLAN_REWRITE_SUMMARIZER = CommitSummarizer(model_name)
+            summarizer = _FLAN_REWRITE_SUMMARIZER
+            result = summarizer.generate(prompt, max_length=48, num_beams=1)
+            if not result:
+                return None
+            result = result.strip().strip('"\'')
+            return result if result and len(result.split()) <= 14 else None
+        except Exception:
+            return None
 
     def extract_keywords(self, question: str) -> list[str]:
         """Extract meaningful keywords from a question.

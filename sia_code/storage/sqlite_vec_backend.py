@@ -106,6 +106,7 @@ class SqliteVecBackend(StorageBackend):
         self.max_vectors_per_file = int(kwargs.pop("max_vectors_per_file", 0) or 0)
         self.semantic_chunk_types = set(kwargs.pop("semantic_chunk_types", []) or [])
         self.persistent_embedding_cache = bool(kwargs.pop("persistent_embedding_cache", True))
+        self.flan_query_rewrite = bool(kwargs.pop("flan_query_rewrite", False))
 
         # Paths
         self.db_path = self.path / "index.db"

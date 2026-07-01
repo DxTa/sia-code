@@ -186,6 +186,7 @@ def create_backend(
         max_vectors_per_file=config.embedding.max_vectors_per_file,
         semantic_chunk_types=config.embedding.semantic_chunk_types,
         persistent_embedding_cache=config.embedding.persistent_cache,
+        flan_query_rewrite=config.search.flan_query_rewrite,
         valid_chunks=valid_chunks,
     )
 
@@ -572,7 +573,7 @@ def index(
         recommend_repo_timeout_seconds,
     )
 
-    if is_multi_repo_workspace(directory):
+    if config.multi_repo.enabled and is_multi_repo_workspace(directory):
         sub_repos = detect_sub_repos(directory)
         console.print(
             f"[cyan]Detected multi-repo workspace with {len(sub_repos)} repos[/cyan]"
@@ -648,6 +649,7 @@ def index(
 
         def _run_repo_plan(plan: dict) -> dict:
             clean_flag = "True" if clean else "False"
+            update_flag = "True" if update else "False"
             index_script = (
                 "import sys, json, os\n"
                 "os.environ.setdefault('HF_HUB_OFFLINE', '1')\n"
@@ -658,11 +660,14 @@ def index(
                 f"sia_dir = Path({str(plan['repo_index_dir'])!r})\n"
                 f"repo_dir = Path({str(plan['repo_path'])!r})\n"
                 f"do_clean = {clean_flag}\n"
+                f"do_update = {update_flag}\n"
                 "config = Config.load(sia_dir / 'config.json')\n"
+                "if do_clean:\n"
+                "    for stale in ('index.db', 'vectors.usearch'):\n"
+                "        fp = sia_dir / stale\n"
+                "        if fp.exists(): fp.unlink()\n"
                 "backend = create_backend(sia_dir, config, suppress_stdout_notices=True)\n"
                 "if do_clean:\n"
-                "    idx = sia_dir / 'index.db'\n"
-                "    if idx.exists(): idx.unlink()\n"
                 "    backend.create_index()\n"
                 "else:\n"
                 "    try:\n"
@@ -670,7 +675,14 @@ def index(
                 "    except Exception:\n"
                 "        backend.create_index()\n"
                 "coord = IndexingCoordinator(config, backend)\n"
-                "stats = coord.index_directory(repo_dir)\n"
+                "if do_update:\n"
+                "    from sia_code.indexer.hash_cache import HashCache\n"
+                "    from sia_code.indexer.chunk_index import ChunkIndex\n"
+                "    cache = HashCache(sia_dir / 'cache' / 'file_hashes.json')\n"
+                "    chunk_index = ChunkIndex(sia_dir / 'chunk_index.json')\n"
+                "    stats = coord.index_directory_incremental_v2(repo_dir, cache, chunk_index)\n"
+                "else:\n"
+                "    stats = coord.index_directory(repo_dir)\n"
                 "backend.close()\n"
                 "print(json.dumps(stats))\n"
             )
@@ -788,6 +800,32 @@ def index(
         total_chunks = sum(s.get("total_chunks", 0) for s in all_stats)
         console.print(f"  Total: {total_files} files, {total_chunks} chunks across {len(all_stats)} repos")
         return
+
+    # --- Single-repo indexing with repo-aware profile overrides ---
+    repo_config = build_repo_config(config, directory.name)
+    if repo_config != config:
+        config = repo_config
+        # Persist effective repo config for transparency and consistent subsequent commands
+        try:
+            config.save(sia_dir / "config.json")
+        except Exception:
+            pass
+        try:
+            backend.close()
+        except Exception:
+            pass
+        backend = create_backend(sia_dir, config)
+        index_path = sia_dir / "index.db"
+        if clean:
+            if index_path.exists():
+                index_path.unlink()
+            backend.create_index()
+        else:
+            try:
+                backend.open_index()
+            except Exception:
+                backend.create_index()
+        coordinator = IndexingCoordinator(config, backend)
 
     # --- Single-repo indexing (original flow) ---
 
@@ -2905,10 +2943,13 @@ def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format)
     classifier = IntentClassifier()
 
     all_results = {}
+    warnings = []
     for fp in file_paths:
         hist = mem.file_history(fp, cross_branch=gc.cross_branch_enabled, limit=15)
         if not hist.effective_commits:
-            console.print(f"[yellow]No history found for {fp}[/yellow]")
+            warnings.append(f"No history found for {fp}")
+            if output_format != "json":
+                console.print(f"[yellow]No history found for {fp}[/yellow]")
             continue
 
         # Classify intents
@@ -2939,14 +2980,10 @@ def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format)
 
         all_results[fp] = entry
 
-    if not all_results:
-        console.print("[red]No results found.[/red]")
-        return
-
     if output_format == "json":
         import json
 
-        data = {}
+        data = {"files": {}, "warnings": warnings}
         for fp, entry in all_results.items():
             hist = entry["hist"]
             d = {
@@ -2979,10 +3016,15 @@ def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format)
                 d["narrative"] = entry["narrative"].narrative
                 d["phases"] = entry["narrative"].key_phases
                 d["model_used"] = entry["narrative"].model_used
-            data[fp] = d
+            data["files"][fp] = d
         console.print(json.dumps(data, indent=2))
-    else:
-        # Table format
+        return
+
+    if not all_results:
+        console.print("[red]No results found.[/red]")
+        return
+
+    # Table format
         for fp, entry in all_results.items():
             hist = entry["hist"]
             console.print(f"\n[bold]{'='*60}[/bold]")
