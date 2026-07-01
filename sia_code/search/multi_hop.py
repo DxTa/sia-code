@@ -1,10 +1,10 @@
 """Multi-hop code research for discovering code relationships."""
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Set
 
-from ..core.models import Chunk, CodeRelationshipRecord
+from ..core.models import Chunk, CodeRelationshipRecord, SearchResult
 from ..core.types import ChunkId
 from ..storage.base import StorageBackend
 from .entity_extractor import EntityExtractor, Entity
@@ -50,34 +50,79 @@ class MultiHopSearchStrategy:
         self.extractor = EntityExtractor()
         self._preprocessor = QueryPreprocessor()  # Cache instance to avoid recreation
 
-    def _initial_search(self, question: str, k: int) -> list:
-        """Perform initial search with adaptive mode selection.
+    def _aggregate_seed_results(
+        self, result_sets: list[list[SearchResult]], k: int
+    ) -> list[SearchResult]:
+        """Merge result sets from multiple query variants.
 
-        Args:
-            question: Natural language question
-            k: Number of results to return
-
-        Returns:
-            List of search results
+        Uses retrieval evidence to rank variants implicitly:
+        - better scores win
+        - repeated hits across variants get a modest boost
+        - earlier ranks contribute slightly more than later ranks
         """
+        merged: dict[str, tuple[SearchResult, float, int, float]] = {}
+        for results in result_sets:
+            for rank, r in enumerate(results, start=1):
+                key = (
+                    str(r.chunk.id)
+                    if r.chunk.id
+                    else f"{r.chunk.file_path}:{r.chunk.symbol}:{r.chunk.start_line}:{r.chunk.end_line}"
+                )
+                rank_bonus = 0.05 / rank
+                if key in merged:
+                    base, best_score, hits, bonus = merged[key]
+                    merged[key] = (base, max(best_score, r.score), hits + 1, bonus + rank_bonus)
+                else:
+                    merged[key] = (r, r.score, 1, rank_bonus)
+
+        ranked: list[SearchResult] = []
+        for base, best_score, hits, bonus in merged.values():
+            combined = best_score + (0.03 * (hits - 1)) + bonus
+            ranked.append(replace(base, score=combined))
+        ranked.sort(key=lambda x: x.score, reverse=True)
+        return ranked[:k]
+
+    def _initial_search(self, question: str, k: int) -> list:
+        """Perform initial search with adaptive mode selection and query rewrites."""
+        allow_model = bool(getattr(self.backend, "flan_query_rewrite", False))
+        variants = self._preprocessor.expand_variants(question, allow_model=allow_model)
+        if not variants:
+            variants = [question]
+
         if self.backend.embedding_enabled:
             try:
-                logger.info(f"Using semantic search for query: {question[:100]}")
-                return self.backend.search_semantic(question, k=k)
+                granularity = getattr(self.backend, "embedding_granularity", "chunk")
+                result_sets: list[list[SearchResult]] = []
+
+                if granularity == "budget":
+                    logger.info(
+                        f"Using hybrid multi-variant search for budgeted index query: {question[:100]}"
+                    )
+                    for i, variant in enumerate(variants):
+                        vw = 0.4 if i == 0 else 0.3
+                        result_sets.append(
+                            self.backend.search_hybrid(variant, k=max(k, 8), vector_weight=vw)
+                        )
+                    return self._aggregate_seed_results(result_sets, k)
+
+                logger.info(f"Using semantic+hybrid variant search for query: {question[:100]}")
+                result_sets.append(self.backend.search_semantic(variants[0], k=max(k, 8)))
+                if len(variants) > 1:
+                    result_sets.append(
+                        self.backend.search_hybrid(variants[1], k=max(k, 8), vector_weight=0.5)
+                    )
+                if len(variants) > 2:
+                    result_sets.append(self.backend.search_lexical(variants[2], k=max(k, 6)))
+                return self._aggregate_seed_results(result_sets, k)
             except Exception as e:
                 logger.warning(
-                    f"Semantic search failed ({e.__class__.__name__}: {str(e)}), "
+                    f"Semantic/hybrid variant search failed ({e.__class__.__name__}: {str(e)}), "
                     "falling back to lexical search"
                 )
-                # Fall through to lexical search
 
-        # Lexical search path
-        logger.info(f"Using lexical search for query: {question[:100]}")
-        processed_query = self._preprocessor.preprocess(question)
-        search_query = processed_query or question
-        if not processed_query:
-            logger.debug(f"Preprocessing returned empty for query: {question[:100]}")
-        return self.backend.search_lexical(search_query, k=k)
+        logger.info(f"Using lexical variant search for query: {question[:100]}")
+        result_sets = [self.backend.search_lexical(v, k=max(k, 8)) for v in variants]
+        return self._aggregate_seed_results(result_sets, k)
 
     def _expand_from_persisted_graph(
         self,

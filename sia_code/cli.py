@@ -4,7 +4,7 @@ import os
 import sys
 import logging
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -23,7 +23,7 @@ from . import __version__
 from .config import Config
 from .indexer.coordinator import IndexingCoordinator
 
-console = Console()
+console = Console(force_terminal=True)
 
 
 def _display_skip_summary(
@@ -182,6 +182,11 @@ def create_backend(
         embedding_enabled=config.embedding.enabled,
         embedding_model=config.embedding.model,
         ndim=config.embedding.dimensions,
+        embedding_granularity=config.embedding.granularity,
+        max_vectors_per_file=config.embedding.max_vectors_per_file,
+        semantic_chunk_types=config.embedding.semantic_chunk_types,
+        persistent_embedding_cache=config.embedding.persistent_cache,
+        flan_query_rewrite=config.search.flan_query_rewrite,
         valid_chunks=valid_chunks,
     )
 
@@ -360,6 +365,46 @@ def require_initialized() -> tuple[Path, Config]:
     return sia_dir, config
 
 
+def get_multi_repo_backends(cwd: Path | None = None):
+    """Check if in a multi-repo workspace and return all backends.
+
+    Returns:
+        list of (repo_name, backend) tuples, or empty list if not multi-repo
+    """
+    from .storage.multi_repo import MultiRepoRegistry, get_registry_path
+
+    workspace = cwd or Path.cwd()
+    registry_path = get_registry_path(workspace)
+    registry = MultiRepoRegistry.load(registry_path)
+
+    entries = []
+    if registry and registry.repos:
+        entries = [(entry.name, workspace / entry.index_dir) for entry in registry.repos]
+    else:
+        # Fallback: infer from workspace-level repos dir even if registry missing/interrupted
+        repos_root = workspace / ".sia-code" / "repos"
+        if repos_root.exists():
+            entries = [
+                (child.name, child)
+                for child in sorted(repos_root.iterdir())
+                if child.is_dir() and (child / "index.db").exists()
+            ]
+        if not entries:
+            return []
+
+    backends = []
+    for repo_name, repo_sia_dir in entries:
+        if (repo_sia_dir / "index.db").exists():
+            try:
+                config = Config.load(repo_sia_dir / "config.json")
+                backend = create_backend(repo_sia_dir, config, suppress_stdout_notices=True)
+                backend.open_index()
+                backends.append((repo_name, backend))
+            except Exception:
+                pass
+    return backends
+
+
 @click.group()
 @click.version_option(version=__version__)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
@@ -514,6 +559,275 @@ def index(
 
     # Index directory
     directory = Path(path).resolve()
+
+    # Auto-detect multi-repo workspace (multiple git sub-repos)
+    from .storage.multi_repo import (
+        build_registry,
+        build_repo_config,
+        detect_sub_repos,
+        estimate_chunks,
+        estimate_indexable_files,
+        estimate_semantic_vectors,
+        get_registry_path,
+        is_multi_repo_workspace,
+        recommend_repo_timeout_seconds,
+    )
+
+    if config.multi_repo.enabled and is_multi_repo_workspace(directory):
+        sub_repos = detect_sub_repos(directory)
+        console.print(
+            f"[cyan]Detected multi-repo workspace with {len(sub_repos)} repos[/cyan]"
+        )
+        for repo in sub_repos:
+            console.print(f"  [dim]• {repo.name}[/dim]")
+        console.print()
+
+        # Fan-out: index each repo independently
+        # All indexes stored under workspace .sia-code/repos/<name>/ (no pollution in sub-repos)
+        registry = build_registry(directory, sub_repos)
+        all_stats = []
+        workspace_sia = directory / ".sia-code"
+        registry_path = get_registry_path(directory)
+        registry.save(registry_path)
+
+        # Pre-warm embed daemon (shared across all repos)
+        try:
+            backend_tmp = create_backend(
+                workspace_sia, config, suppress_stdout_notices=True
+            )
+            backend_tmp._get_embedder()
+            console.print("[dim]Embedding daemon ready[/dim]")
+        except Exception:
+            pass
+
+        import time as _time
+        import subprocess as _sp
+        import json as _json
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        plans = []
+        for i, repo_path in enumerate(sub_repos, 1):
+            repo_index_dir = workspace_sia / "repos" / repo_path.name
+            repo_index_dir.mkdir(parents=True, exist_ok=True)
+
+            repo_config = build_repo_config(config, repo_path.name)
+            repo_config_path = repo_index_dir / "config.json"
+            repo_config.save(repo_config_path)
+
+            estimated_files = estimate_indexable_files(repo_path, repo_config)
+            estimated_chunks = estimate_chunks(repo_path, repo_config)
+            estimated_vectors = estimate_semantic_vectors(repo_path, repo_config)
+            repo_timeout = recommend_repo_timeout_seconds(
+                estimated_files, estimated_vectors
+            )
+            is_heavy = estimated_vectors >= config.multi_repo.heavy_repo_chunk_threshold
+
+            for entry in registry.repos:
+                if entry.name == repo_path.name:
+                    entry.index_dir = str(
+                        (workspace_sia / "repos" / repo_path.name).relative_to(directory)
+                    )
+                    entry.estimated_chunks = estimated_vectors
+                    entry.status = "pending"
+                    entry.last_error = None
+                    break
+
+            plans.append(
+                {
+                    "seq": i,
+                    "repo_name": repo_path.name,
+                    "repo_path": repo_path,
+                    "repo_index_dir": repo_index_dir,
+                    "estimated_files": estimated_files,
+                    "estimated_chunks": estimated_vectors,
+                    "raw_chunks": estimated_chunks,
+                    "repo_timeout": repo_timeout,
+                    "heavy": is_heavy,
+                }
+            )
+        registry.save(registry_path)
+
+        def _run_repo_plan(plan: dict) -> dict:
+            clean_flag = "True" if clean else "False"
+            update_flag = "True" if update else "False"
+            index_script = (
+                "import sys, json, os\n"
+                "os.environ.setdefault('HF_HUB_OFFLINE', '1')\n"
+                "from pathlib import Path\n"
+                "from sia_code.config import Config\n"
+                "from sia_code.cli import create_backend\n"
+                "from sia_code.indexer.coordinator import IndexingCoordinator\n"
+                f"sia_dir = Path({str(plan['repo_index_dir'])!r})\n"
+                f"repo_dir = Path({str(plan['repo_path'])!r})\n"
+                f"do_clean = {clean_flag}\n"
+                f"do_update = {update_flag}\n"
+                "config = Config.load(sia_dir / 'config.json')\n"
+                "if do_clean:\n"
+                "    for stale in ('index.db', 'vectors.usearch'):\n"
+                "        fp = sia_dir / stale\n"
+                "        if fp.exists(): fp.unlink()\n"
+                "backend = create_backend(sia_dir, config, suppress_stdout_notices=True)\n"
+                "if do_clean:\n"
+                "    backend.create_index()\n"
+                "else:\n"
+                "    try:\n"
+                "        backend.open_index()\n"
+                "    except Exception:\n"
+                "        backend.create_index()\n"
+                "coord = IndexingCoordinator(config, backend)\n"
+                "if do_update:\n"
+                "    from sia_code.indexer.hash_cache import HashCache\n"
+                "    from sia_code.indexer.chunk_index import ChunkIndex\n"
+                "    cache = HashCache(sia_dir / 'cache' / 'file_hashes.json')\n"
+                "    chunk_index = ChunkIndex(sia_dir / 'chunk_index.json')\n"
+                "    stats = coord.index_directory_incremental_v2(repo_dir, cache, chunk_index)\n"
+                "else:\n"
+                "    stats = coord.index_directory(repo_dir)\n"
+                "backend.close()\n"
+                "print(json.dumps(stats))\n"
+            )
+            t0 = _time.monotonic()
+            try:
+                result = _sp.run(
+                    [sys.executable, "-c", index_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=plan["repo_timeout"],
+                )
+                elapsed = _time.monotonic() - t0
+                if result.returncode == 0:
+                    stdout_lines = result.stdout.strip().splitlines()
+                    stats_line = stdout_lines[-1] if stdout_lines else '{}'
+                    try:
+                        stats = _json.loads(stats_line)
+                    except _json.JSONDecodeError:
+                        stats = {"indexed_files": 0, "total_chunks": 0}
+                    return {"kind": "ok", "plan": plan, "elapsed": elapsed, "stats": stats}
+                err_lines = result.stderr.strip().splitlines()
+                err_msg = err_lines[-1][:120] if err_lines else "unknown"
+                return {"kind": "failed", "plan": plan, "elapsed": elapsed, "error": err_msg}
+            except _sp.TimeoutExpired:
+                elapsed = _time.monotonic() - t0
+                return {"kind": "timed_out", "plan": plan, "elapsed": elapsed, "error": f"timeout after {plan['repo_timeout']}s"}
+            except Exception as e:
+                elapsed = _time.monotonic() - t0
+                return {"kind": "failed", "plan": plan, "elapsed": elapsed, "error": str(e)[:120]}
+
+        def _mark_started(plan: dict):
+            console.print(
+                f"[cyan][{plan['seq']}/{len(sub_repos)}] Indexing {plan['repo_name']}...[/cyan]"
+            )
+            console.print(
+                f"    [dim]~{plan['estimated_files']} files, ~{plan['raw_chunks']} chunks, ~{plan['estimated_chunks']} vectors, timeout {plan['repo_timeout']}s{' [heavy]' if plan['heavy'] else ''}[/dim]"
+            )
+            for entry in registry.repos:
+                if entry.name == plan['repo_name']:
+                    entry.status = 'indexing'
+                    entry.last_error = None
+                    break
+            registry.save(registry_path)
+
+        def _record_result(result: dict):
+            plan = result['plan']
+            if result['kind'] == 'ok':
+                stats = result['stats']
+                all_stats.append(stats)
+                for entry in registry.repos:
+                    if entry.name == plan['repo_name']:
+                        entry.indexed_at = datetime.now(timezone.utc).isoformat()
+                        entry.file_count = stats.get('indexed_files', 0)
+                        entry.status = 'full'
+                        entry.last_error = None
+                        break
+                registry.save(registry_path)
+                console.print(
+                    f"    [green]✓[/green] {stats.get('indexed_files', 0)} files, {stats.get('total_chunks', 0)} chunks [dim]({result['elapsed']:.1f}s)[/dim]"
+                )
+            elif result['kind'] == 'timed_out':
+                for entry in registry.repos:
+                    if entry.name == plan['repo_name']:
+                        entry.status = 'timed_out'
+                        entry.last_error = result['error']
+                        break
+                registry.save(registry_path)
+                console.print(
+                    f"    [yellow]⚠ Timeout ({result['elapsed']:.0f}s/{plan['repo_timeout']}s) — skipped[/yellow]"
+                )
+            else:
+                for entry in registry.repos:
+                    if entry.name == plan['repo_name']:
+                        entry.status = 'failed'
+                        entry.last_error = result['error']
+                        break
+                registry.save(registry_path)
+                console.print(
+                    f"    [red]✗ Failed ({result['elapsed']:.1f}s): {result['error']}[/red]"
+                )
+
+        concurrency = max(1, int(config.multi_repo.fanout_concurrency))
+        batch: list[dict] = []
+        def _flush_batch(batch_plans: list[dict]):
+            if not batch_plans:
+                return
+            if len(batch_plans) == 1:
+                _mark_started(batch_plans[0])
+                _record_result(_run_repo_plan(batch_plans[0]))
+                return
+            for p in batch_plans:
+                _mark_started(p)
+            with ThreadPoolExecutor(max_workers=min(concurrency, len(batch_plans))) as ex:
+                futs = [ex.submit(_run_repo_plan, p) for p in batch_plans]
+                for fut in as_completed(futs):
+                    _record_result(fut.result())
+
+        for plan in plans:
+            if plan['heavy']:
+                _flush_batch(batch)
+                batch = []
+                _flush_batch([plan])
+            else:
+                batch.append(plan)
+                if len(batch) >= concurrency:
+                    _flush_batch(batch)
+                    batch = []
+        _flush_batch(batch)
+
+        # Save registry
+        registry.save(registry_path)
+        console.print("\n[green]✓ Multi-repo indexing complete[/green]")
+        console.print(f"  Registry: {registry_path}")
+        total_files = sum(s.get("indexed_files", 0) for s in all_stats)
+        total_chunks = sum(s.get("total_chunks", 0) for s in all_stats)
+        console.print(f"  Total: {total_files} files, {total_chunks} chunks across {len(all_stats)} repos")
+        return
+
+    # --- Single-repo indexing with repo-aware profile overrides ---
+    repo_config = build_repo_config(config, directory.name)
+    if repo_config != config:
+        config = repo_config
+        # Persist effective repo config for transparency and consistent subsequent commands
+        try:
+            config.save(sia_dir / "config.json")
+        except Exception:
+            pass
+        try:
+            backend.close()
+        except Exception:
+            pass
+        backend = create_backend(sia_dir, config)
+        index_path = sia_dir / "index.db"
+        if clean:
+            if index_path.exists():
+                index_path.unlink()
+            backend.create_index()
+        else:
+            try:
+                backend.open_index()
+            except Exception:
+                backend.create_index()
+        coordinator = IndexingCoordinator(config, backend)
+
+    # --- Single-repo indexing (original flow) ---
 
     if update:
         console.print(f"[cyan]Incremental indexing {directory}...[/cyan]")
@@ -799,8 +1113,18 @@ def search(
         console.print("[red]Error: --no-deps and --deps-only are mutually exclusive[/red]")
         sys.exit(1)
 
-    backend = create_backend(sia_dir, config, valid_chunks=valid_chunks)
-    backend.open_index()
+    # Multi-repo: if in workspace with registry, search all sub-repos
+    multi_backends = get_multi_repo_backends()
+    _multi_repo_mode = bool(multi_backends)
+    if _multi_repo_mode:
+        console.print(
+            f"[dim]Multi-repo: searching across {len(multi_backends)} repos[/dim]"
+        )
+        # Use primary backend for config-based settings; actual search aggregates all
+        backend = multi_backends[0][1]
+    else:
+        backend = create_backend(sia_dir, config, valid_chunks=valid_chunks)
+        backend.open_index()
 
     # Determine dependency filtering
     # Default: include deps (from config or True)
@@ -825,23 +1149,67 @@ def search(
         console.print(f"[dim]Searching ({mode}{filter_status}{deps_status})...[/dim]")
 
     # Execute search based on mode
-    if regex:
-        results = backend.search_lexical(
-            query, k=limit, include_deps=include_deps, tier_boost=tier_boost
-        )
-    elif semantic_only:
-        results = backend.search_semantic(
-            query, k=limit, include_deps=include_deps, tier_boost=tier_boost
-        )
+    def _search_one_backend(be):
+        if regex:
+            return be.search_lexical(
+                query, k=limit, include_deps=include_deps, tier_boost=tier_boost
+            )
+        elif semantic_only:
+            return be.search_semantic(
+                query, k=limit, include_deps=include_deps, tier_boost=tier_boost
+            )
+        else:
+            return be.search_hybrid(
+                query,
+                k=limit,
+                vector_weight=config.search.vector_weight,
+                include_deps=include_deps,
+                tier_boost=tier_boost,
+            )
+
+    if _multi_repo_mode:
+        # Aggregate results from all repos
+        all_results = []
+        from dataclasses import replace
+        from pathlib import Path as _Path
+
+        for repo_name, be in multi_backends:
+            try:
+                repo_results = _search_one_backend(be)
+                rewritten = []
+                repo_root = Path.cwd() / repo_name
+                for r in repo_results:
+                    try:
+                        orig_path = Path(r.chunk.file_path)
+                        rel_path = orig_path.relative_to(repo_root) if orig_path.is_absolute() else orig_path
+                    except Exception:
+                        rel_path = Path(r.chunk.file_path).name
+                    new_chunk = replace(
+                        r.chunk,
+                        file_path=_Path(repo_name) / rel_path,
+                    )
+                    rewritten.append(replace(r, chunk=new_chunk))
+                all_results.extend(rewritten)
+            except Exception:
+                pass
+        # Repo-aware re-ranking before slice
+        from .storage.multi_repo import build_ranking_context, get_repo_profile
+        _rctx = build_ranking_context(Path.cwd(), query)
+        reranked = []
+        for r in all_results:
+            _repo = str(r.chunk.metadata.get("_repo_name", ""))
+            if not _repo:
+                # infer from rewritten file_path first component
+                _repo = str(r.chunk.file_path).split("/")[0]
+            _profile = get_repo_profile(_repo)
+            _adj = _rctx.adjusted_score(
+                r.score, _repo, _profile, str(r.chunk.file_path)
+            )
+            reranked.append(replace(r, score=_adj))
+        # Sort by adjusted score descending, take top `limit`
+        results = sorted(reranked, key=lambda r: r.score, reverse=True)[:limit]
     else:
-        # NEW: Hybrid search (BM25 + semantic) for best performance
-        results = backend.search_hybrid(
-            query,
-            k=limit,
-            vector_weight=config.search.vector_weight,
-            include_deps=include_deps,
-            tier_boost=tier_boost,
-        )
+        results = _search_one_backend(backend)
 
     # Filter for --deps-only after search
     if deps_only and results:
@@ -1125,20 +1493,96 @@ def research(question: str, hops: int, graph: bool, limit: int, no_filter: bool)
             except Exception:
                 pass  # Silently fall back to no filtering
 
-    backend = create_backend(sia_dir, config, valid_chunks=valid_chunks)
-    backend.open_index()
-
-    strategy = MultiHopSearchStrategy(backend, max_hops=hops)
-
+    multi_backends = get_multi_repo_backends()
     console.print(f"[dim]Researching: {question}[/dim]")
     console.print(f"[dim]Max hops: {hops}, Results per hop: {limit}[/dim]\n")
 
-    with Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
-    ) as progress:
-        task = progress.add_task("Analyzing code relationships...", total=None)
-        result = strategy.research(question, max_results_per_hop=limit)
-        progress.update(task, completed=True)
+    if multi_backends:
+        from dataclasses import replace
+        from pathlib import Path as _Path
+        from .storage.multi_repo import build_ranking_context, get_repo_profile
+
+        combined_chunks = []
+        combined_relationships = []
+        max_hops_executed = 0
+        total_entities_found = 0
+
+        # Build ranking context once for this question to score each repo
+        _rctx_pre = build_ranking_context(Path.cwd(), question)
+        _repo_scores = {
+            rname: _rctx_pre.repo_score(rname, get_repo_profile(rname))
+            for rname, _ in multi_backends
+        }
+        # Determine include threshold: take repos with top-N scores or score > 0
+        _sorted_scores = sorted(_repo_scores.values(), reverse=True)
+        _top_threshold = _sorted_scores[min(4, len(_sorted_scores) - 1)] if _sorted_scores else 0.0
+        # Always include repos with any non-zero score; fallback: include all if none score > 0
+        _any_positive = any(v > 0 for v in _repo_scores.values())
+
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+        ) as progress:
+            task = progress.add_task("Analyzing code relationships across repos...", total=None)
+            for repo_name, backend in multi_backends:
+                try:
+                    repo_score = _repo_scores.get(repo_name, 0.0)
+                    # Skip repos with zero relevance if at least some repos are relevant
+                    if _any_positive and repo_score <= 0:
+                        continue
+                    strategy = MultiHopSearchStrategy(backend, max_hops=hops)
+                    repo_result = strategy.research(question, max_results_per_hop=limit)
+                    if repo_result.chunks:
+                        repo_root = Path.cwd() / repo_name
+                        rewritten_chunks = []
+                        for chunk in repo_result.chunks:
+                            try:
+                                orig_path = Path(chunk.file_path)
+                                rel_path = orig_path.relative_to(repo_root) if orig_path.is_absolute() else orig_path
+                            except Exception:
+                                rel_path = Path(chunk.file_path).name
+                            rewritten_chunks.append(
+                                replace(chunk, file_path=_Path(repo_name) / rel_path)
+                            )
+                        combined_chunks.extend(rewritten_chunks)
+                        combined_relationships.extend(repo_result.relationships)
+                        max_hops_executed = max(max_hops_executed, repo_result.hops_executed)
+                        total_entities_found += repo_result.total_entities_found
+                except Exception:
+                    pass
+            progress.update(task, completed=True)
+
+        from .search.multi_hop import ResearchResult
+        # Repo-aware re-ranking of combined research chunks
+        from .storage.multi_repo import build_ranking_context, get_repo_profile
+        _rctx = build_ranking_context(Path.cwd(), question)
+        reranked_chunks = []
+        _n = max(len(combined_chunks), 1)
+        for _i, chunk in enumerate(combined_chunks):
+            _repo = str(chunk.file_path).split("/")[0]
+            _profile = get_repo_profile(_repo)
+            _base = 1.0 - (_i / _n) * 0.5
+            _adj = _rctx.adjusted_score(_base, _repo, _profile, str(chunk.file_path))
+            reranked_chunks.append((_adj, chunk))
+        reranked_chunks.sort(key=lambda x: x[0], reverse=True)
+        sorted_chunks = [c for _, c in reranked_chunks]
+        result = ResearchResult(
+            question=question,
+            chunks=sorted_chunks[: max(10, limit * 4)],
+            relationships=combined_relationships,
+            hops_executed=max_hops_executed,
+            total_entities_found=total_entities_found,
+        )
+    else:
+        backend = create_backend(sia_dir, config, valid_chunks=valid_chunks)
+        backend.open_index()
+        strategy = MultiHopSearchStrategy(backend, max_hops=hops)
+
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+        ) as progress:
+            task = progress.add_task("Analyzing code relationships...", total=None)
+            result = strategy.research(question, max_results_per_hop=limit)
+            progress.update(task, completed=True)
 
     # Display results summary
     console.print("\n[bold green]✓ Research Complete[/bold green]")
@@ -1193,6 +1637,106 @@ def status():
     from .indexer.chunk_index import ChunkIndex
 
     sia_dir, config = require_initialized()
+
+    # Multi-repo aggregate status
+    multi_backends = get_multi_repo_backends()
+    if multi_backends:
+        from .storage.multi_repo import MultiRepoRegistry, get_registry_path
+
+        registry = MultiRepoRegistry.load(get_registry_path(Path.cwd()))
+        total_files = 0
+        total_chunks = 0
+        repo_rows = []
+        status_counts: dict[str, int] = {}
+        meta_by_name = {entry.name: entry for entry in (registry.repos if registry else [])}
+        for repo_name, backend in multi_backends:
+            try:
+                stats = backend.get_stats()
+                total_files += stats.total_files
+                total_chunks += stats.total_chunks
+                meta = meta_by_name.get(repo_name)
+                status_value = meta.status if meta else "indexed"
+                if status_value == "pending" and stats.total_chunks > 0:
+                    status_value = "indexed"
+                status_counts[status_value] = status_counts.get(status_value, 0) + 1
+                repo_rows.append(
+                    (
+                        repo_name,
+                        meta.profile if meta else "general",
+                        status_value,
+                        meta.estimated_chunks if meta else 0,
+                        stats.total_files,
+                        stats.total_chunks,
+                        meta.last_error if meta else None,
+                    )
+                )
+            except Exception:
+                meta = meta_by_name.get(repo_name)
+                status_value = meta.status if meta else "error"
+                status_counts[status_value] = status_counts.get(status_value, 0) + 1
+                repo_rows.append(
+                    (
+                        repo_name,
+                        meta.profile if meta else "general",
+                        status_value,
+                        meta.estimated_chunks if meta else 0,
+                        0,
+                        0,
+                        meta.last_error if meta else None,
+                    )
+                )
+
+        if registry:
+            for entry in registry.repos:
+                if entry.name not in {row[0] for row in repo_rows}:
+                    status_counts[entry.status] = status_counts.get(entry.status, 0) + 1
+                    repo_rows.append(
+                        (
+                            entry.name,
+                            entry.profile,
+                            entry.status,
+                            entry.estimated_chunks,
+                            0,
+                            0,
+                            entry.last_error,
+                        )
+                    )
+
+        table = Table(title="Sia Code Index Status (Multi-Repo)")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Workspace Index Path", str(sia_dir))
+        table.add_row("Registered Repos", f"{len(repo_rows):,}")
+        table.add_row("Indexed Repos", f"{len(multi_backends):,}")
+        table.add_row("Total Files", f"{total_files:,}")
+        table.add_row("Total Chunks", f"{total_chunks:,}")
+        if status_counts:
+            table.add_row(
+                "Repo States",
+                ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items())),
+            )
+        console.print(table)
+
+        repo_table = Table(title="Per-Repo Status")
+        repo_table.add_column("Repo", style="cyan")
+        repo_table.add_column("Profile")
+        repo_table.add_column("State")
+        repo_table.add_column("Est Chunks", justify="right")
+        repo_table.add_column("Files", justify="right")
+        repo_table.add_column("Chunks", justify="right")
+        repo_table.add_column("Last Error", overflow="fold")
+        for repo_name, profile, state, est_chunks, files_n, chunks_n, last_error in sorted(repo_rows):
+            repo_table.add_row(
+                repo_name,
+                profile,
+                state,
+                f"{est_chunks:,}" if est_chunks else "-",
+                f"{files_n:,}",
+                f"{chunks_n:,}",
+                (last_error or "")[:80],
+            )
+        console.print(repo_table)
+        return
 
     backend = create_backend(sia_dir, config)
     backend.open_index()
@@ -2396,6 +2940,190 @@ def embed_status(verbose):
         if "reason" in status:
             console.print(f"  Reason: {status['reason']}")
         console.print("\n[dim]Start with: sia-code embed start[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Git Memory CLI Commands (consolidated)
+# ---------------------------------------------------------------------------
+
+
+@memory.command(name="git-context")
+@click.argument("file_paths", nargs=-1, required=True)
+@click.option("--no-blast-radius", is_flag=True, help="Skip blast radius analysis")
+@click.option("--no-narrative", is_flag=True, help="Skip evolution narrative")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+)
+def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format):
+    """Show git context for files: history, blast radius, and evolution narrative.
+
+    Combines file history (revert-aware, cross-branch, recency-scored),
+    co-change blast radius, and model-generated evolution narrative.
+    Auto-uses local flan-t5 model for narrative when available.
+
+    Examples:
+        sia-code memory git-context src/api/datasample.py
+        sia-code memory git-context src/api.py src/crud.py --format json
+        sia-code memory git-context src/api.py --no-narrative
+    """
+    from .config import Config
+    from .memory.blast_radius import BlastRadiusAnalyzer
+    from .memory.diff_analyzer import DiffSemanticAnalyzer
+    from .memory.git_dynamic import GitDynamicMemory
+    from .memory.intent_classifier import IntentClassifier
+    from .memory.recency import RecencyConfig
+
+    project_dir = Path.cwd()
+    config = Config.load(project_dir / ".sia-code" / "config.json")
+    gc = config.git_dynamic
+
+    recency_cfg = RecencyConfig(
+        halflife_days=gc.recency_halflife_days,
+        working_window_days=gc.working_window_days,
+    )
+    mem = GitDynamicMemory(project_dir, recency_config=recency_cfg)
+    classifier = IntentClassifier()
+
+    all_results = {}
+    warnings = []
+    for fp in file_paths:
+        hist = mem.file_history(fp, cross_branch=gc.cross_branch_enabled, limit=15)
+        if not hist.effective_commits:
+            warnings.append(f"No history found for {fp}")
+            if output_format != "json":
+                console.print(f"[yellow]No history found for {fp}[/yellow]")
+            continue
+
+        # Classify intents
+        for c in hist.effective_commits:
+            intent = classifier.classify(c.message, len(c.files_changed), c.insertions + c.deletions)
+            c.intent = intent.intent
+
+        entry = {"hist": hist, "radius": None, "narrative": None}
+
+        # Blast radius
+        if not no_blast_radius:
+            analyzer = BlastRadiusAnalyzer(
+                project_dir,
+                lookback=gc.lookback_commits,
+                min_coupling=gc.coupling_threshold,
+                max_files_per_commit=gc.max_files_per_commit,
+                recency_config=recency_cfg,
+            )
+            entry["radius"] = analyzer.co_changed_files(fp)
+
+        # Narrative
+        if not no_narrative:
+            try:
+                diff_analyzer = DiffSemanticAnalyzer(project_dir, model_name=gc.narrative_model)
+                entry["narrative"] = diff_analyzer.summarize_evolution(hist)
+            except Exception:
+                pass
+
+        all_results[fp] = entry
+
+    if output_format == "json":
+        import json
+
+        data = {"files": {}, "warnings": warnings}
+        for fp, entry in all_results.items():
+            hist = entry["hist"]
+            d = {
+                "branch_context": {
+                    "current": hist.branch_context.current_branch if hist.branch_context else None,
+                    "base": hist.branch_context.base_branch if hist.branch_context else None,
+                },
+                "owners": hist.owners[:3],
+                "reverts": [
+                    {"reverted": r.reverted_hash[:7], "by": r.reverting_hash[:7]}
+                    for r in hist.reverts
+                ],
+                "commits": [
+                    {
+                        "hash": c.hash[:7],
+                        "message": c.message,
+                        "intent": c.intent,
+                        "recency": round(c.recency_score, 3),
+                        "author": c.author,
+                    }
+                    for c in hist.effective_commits[:10]
+                ],
+            }
+            if entry["radius"]:
+                d["blast_radius"] = [
+                    {"path": cf.path, "coupling": round(cf.coupling_score, 3)}
+                    for cf in entry["radius"].coupled_files[:10]
+                ]
+            if entry["narrative"]:
+                d["narrative"] = entry["narrative"].narrative
+                d["phases"] = entry["narrative"].key_phases
+                d["model_used"] = entry["narrative"].model_used
+            data["files"][fp] = d
+        console.print(json.dumps(data, indent=2))
+        return
+
+    if not all_results:
+        console.print("[red]No results found.[/red]")
+        return
+
+    # Table format
+    for fp, entry in all_results.items():
+        hist = entry["hist"]
+        console.print(f"\n[bold]{'='*60}[/bold]")
+        console.print(f"[bold]File:[/bold] {fp}")
+        if hist.branch_context:
+            ctx = hist.branch_context
+            console.print(
+                f"  Branch: {ctx.current_branch} | Base: {ctx.base_branch}"
+            )
+        if hist.owners:
+            owners_str = ", ".join(f"{a} ({n})" for a, n in hist.owners[:3])
+            console.print(f"  Owners: {owners_str}")
+        if hist.reverts:
+            console.print(f"  [yellow]Reverts: {len(hist.reverts)}[/yellow]")
+            for r in hist.reverts:
+                console.print(f"    {r.reverting_hash[:7]} reverts {r.reverted_hash[:7]}")
+
+        # Narrative
+        if entry["narrative"]:
+            n = entry["narrative"]
+            model_tag = f" [dim](via {n.model_used})[/dim]" if n.model_used else " [dim](heuristic)[/dim]"
+            console.print(f"\n  [bold]Evolution:[/bold]{model_tag}")
+            console.print(f"  {n.narrative}")
+            if n.key_phases:
+                console.print(f"  Phases: {', '.join(n.key_phases)}")
+
+        # Commits
+        console.print(f"\n  [bold]History[/bold] ({len(hist.effective_commits)} effective):")
+        for c in hist.effective_commits[:8]:
+            intent_tag = f"[{c.intent}]" if c.intent else ""
+            console.print(
+                f"    [{c.recency_score:.2f}] {c.hash[:7]} {c.message[:55]} "
+                f"[dim]{c.author} {intent_tag}[/dim]"
+            )
+
+        # Blast radius
+        if entry["radius"] and entry["radius"].coupled_files:
+            radius = entry["radius"]
+            console.print(
+                f"\n  [bold]Blast Radius[/bold] "
+                f"({radius.total_commits_analyzed} commits, "
+                f"{radius.commits_excluded_squash} squash-excluded):"
+            )
+            for cf in radius.coupled_files[:8]:
+                bar = "█" * int(cf.coupling_score * 20)
+                console.print(
+                    f"    [{cf.coupling_score:.2f}] {bar:20s} {cf.path}"
+                )
+            if radius.change_clusters:
+                for cl in radius.change_clusters:
+                    console.print(
+                        f"    [dim]Cluster (cohesion {cl.cohesion_score:.2f}): "
+                        f"{', '.join(cl.files)}[/dim]"
+                    )
 
 
 if __name__ == "__main__":

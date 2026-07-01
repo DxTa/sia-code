@@ -89,6 +89,29 @@ class TestQueryPreprocessor:
         assert "load_config" in result
         assert "use" in result
 
+    def test_expand_variants_returns_2_to_3_unique_forms(self, preprocessor):
+        """Expanded variants should keep raw + focused forms without duplicates."""
+        variants = preprocessor.expand_variants(
+            "How does ChipCountingService use load_config in authentication flow?"
+        )
+        assert 2 <= len(variants) <= 3
+        assert variants[0] == "How does ChipCountingService use load_config in authentication flow?"
+        assert any("ChipCountingService" in v for v in variants)
+        assert any("load_config" in v for v in variants)
+        assert len({v.lower() for v in variants}) == len(variants)
+
+    def test_expand_variants_synthesizes_code_forms(self, preprocessor):
+        variants = preprocessor.expand_variants(
+            "How does stable diffusion trainer config work?"
+        )
+        combined = " ".join(variants)
+        assert "StableDiffusionTrainer" in combined or "stable_diffusion_trainer" in combined
+
+    def test_expand_variants_synthesizes_api_forms(self, preprocessor):
+        variants = preprocessor.expand_variants("How does task REST API work?")
+        combined = " ".join(variants)
+        assert any(x in combined for x in ["TaskViewSet", "TaskSerializer", "TaskAPIView"])
+
 
 class TestExtractKeywords:
     """Test keyword extraction specifically."""

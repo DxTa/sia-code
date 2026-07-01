@@ -151,7 +151,7 @@ class EmbedClient:
 
         # Create request
         request_id = str(uuid.uuid4())
-        request = EmbedRequest.create(request_id, self.model_name, sentences)
+        request = EmbedRequest.create(request_id, self.model_name, sentences, batch_size=batch_size)
 
         # Send request
         response = self._send_request(request)

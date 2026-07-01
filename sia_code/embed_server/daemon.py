@@ -137,30 +137,41 @@ class EmbedDaemon:
 
                 # Auto-detect device on first load
                 if not self.models:  # First model
-                    self.device = "cuda" if torch.cuda.is_available() else "cpu"
+                    if torch.cuda.is_available():
+                        self.device = "cuda"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        self.device = "mps"
+                    else:
+                        self.device = "cpu"
                     logger.info(f"Using device: {self.device}")
 
                 # Load model
                 model = SentenceTransformer(model_name, device=self.device)
                 self.models[model_name] = model
 
+                # After successful load, prevent future network calls
+                # Model is now cached locally — no need to hit HF Hub again
+                import os
+                os.environ["HF_HUB_OFFLINE"] = "1"
+
                 logger.info(f"Model loaded: {model_name} ({len(self.models)} total)")
 
             return self.models[model_name]
 
-    def _handle_embed(self, model: str, texts: list[str]) -> dict:
+    def _handle_embed(self, model: str, texts: list[str], batch_size: int = 32) -> dict:
         """Handle embedding request.
 
         Args:
             model: Model name
             texts: List of texts to embed
+            batch_size: Preferred batch size from client
 
         Returns:
             Response dict with embeddings
         """
         try:
             embedder = self._load_model(model)
-            vectors = embedder.encode(texts, convert_to_numpy=True, batch_size=32)
+            vectors = embedder.encode(texts, convert_to_numpy=True, batch_size=batch_size)
 
             return {
                 "embeddings": vectors.tolist(),
@@ -224,13 +235,14 @@ class EmbedDaemon:
                 params = request.get("params", {})
                 model = params.get("model")
                 texts = params.get("texts", [])
+                batch_size = int(params.get("batch_size", 32) or 32)
 
                 if not model or not texts:
                     response = ErrorResponse.create(
                         request_id, "Missing model or texts", "InvalidRequest"
                     )
                 else:
-                    result = self._handle_embed(model, texts)
+                    result = self._handle_embed(model, texts, batch_size=batch_size)
                     response = EmbedResponse.create(
                         request_id,
                         result["embeddings"],

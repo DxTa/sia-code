@@ -827,6 +827,18 @@ def build_server() -> FastMCP:
         else:
             recommended_next_step = "Start with the top search hits, then escalate to research only if cross-file tracing is needed."
 
+        # Auto-enrich with git context for files found in search
+        git_context_payload = {}
+        try:
+            if search_hits and search_hits.get("matches"):
+                hit_files = list({m["file_path"] for m in search_hits["matches"] if "file_path" in m})[:3]
+                if hit_files:
+                    git_context_payload = _compute_git_context(
+                        context.workspace_root, hit_files, limit=3
+                    )
+        except Exception:
+            pass  # Graceful — git context is supplementary
+
         return _ok(
             context=context,
             result={
@@ -839,6 +851,7 @@ def build_server() -> FastMCP:
                 "memory_hits": memory_hits,
                 "working_memory": working_memory,
                 "research": research_payload,
+                "git_context": git_context_payload,
                 "recommended_next_step": recommended_next_step,
                 "fallback_guidance": health["fallback_guidance"],
             },
@@ -1090,6 +1103,19 @@ def build_server() -> FastMCP:
                 for item in result.events
             ],
         }
+
+        # Supplement with dynamic git history for related files
+        dynamic_git = {}
+        try:
+            if result.related_files:
+                dynamic_git = _compute_git_context(
+                    context.workspace_root, result.related_files[:3],
+                    limit=3, include_blast_radius=False,
+                )
+        except Exception:
+            pass
+        payload["dynamic_git"] = dynamic_git
+
         return _ok(context=context, result=payload, embedding_runtime=_embedding_runtime(config))
 
     @mcp.tool()
@@ -1251,6 +1277,146 @@ def build_server() -> FastMCP:
         from .embed_server.daemon import stop_daemon
 
         return _ok(scope="machine", result={"stopped": stop_daemon()})
+
+    # ------------------------------------------------------------------
+    # Dynamic Git Memory (consolidated)
+    # ------------------------------------------------------------------
+
+    def _compute_git_context(
+        workspace_root: Path,
+        file_paths: list[str],
+        limit: int = 5,
+        include_blast_radius: bool = True,
+        include_narrative: bool = True,
+    ) -> dict:
+        """Shared helper — computes git context for files.
+
+        Used by git_context tool, research, engineering_bootstrap, memory_trace.
+        """
+        from .config import Config
+        from .memory.blast_radius import BlastRadiusAnalyzer
+        from .memory.diff_analyzer import DiffSemanticAnalyzer
+        from .memory.git_dynamic import GitDynamicMemory
+        from .memory.intent_classifier import IntentClassifier
+        from .memory.recency import RecencyConfig
+
+        config = Config.load(workspace_root / ".sia-code" / "config.json")
+        gc = config.git_dynamic
+
+        if not gc.enabled:
+            return {}
+
+        recency_cfg = RecencyConfig(
+            halflife_days=gc.recency_halflife_days,
+            working_window_days=gc.working_window_days,
+        )
+        mem = GitDynamicMemory(workspace_root, recency_config=recency_cfg)
+        classifier = IntentClassifier()
+
+        results = {}
+        for fp in file_paths[:limit]:
+            # File history + revert detection + branch context
+            hist = mem.file_history(fp, cross_branch=gc.cross_branch_enabled, limit=10)
+            if not hist.effective_commits:
+                continue
+
+            # Classify intents
+            for c in hist.effective_commits:
+                intent = classifier.classify(
+                    c.message, len(c.files_changed), c.insertions + c.deletions
+                )
+                c.intent = intent.intent
+
+            entry: dict = {
+                "effective_commits": [
+                    {
+                        "hash": c.hash[:7],
+                        "message": c.message,
+                        "author": c.author,
+                        "date": c.date.isoformat(),
+                        "recency_score": round(c.recency_score, 3),
+                        "branch": c.branch,
+                        "intent": c.intent,
+                    }
+                    for c in hist.effective_commits[:8]
+                ],
+                "owners": hist.owners[:3],
+                "reverts": [
+                    {
+                        "reverted": r.reverted_hash[:7],
+                        "by": r.reverting_hash[:7],
+                        "method": r.matched_by,
+                    }
+                    for r in hist.reverts
+                ],
+                "branch_context": {
+                    "current": hist.branch_context.current_branch if hist.branch_context else None,
+                    "base": hist.branch_context.base_branch if hist.branch_context else None,
+                    "merge_base": hist.branch_context.merge_base if hist.branch_context else None,
+                },
+            }
+
+            # Blast radius
+            if include_blast_radius:
+                analyzer = BlastRadiusAnalyzer(
+                    workspace_root,
+                    lookback=gc.lookback_commits,
+                    min_coupling=gc.coupling_threshold,
+                    max_files_per_commit=gc.max_files_per_commit,
+                    recency_config=recency_cfg,
+                )
+                radius = analyzer.co_changed_files(fp)
+                entry["blast_radius"] = [
+                    {
+                        "path": cf.path,
+                        "coupling": round(cf.coupling_score, 3),
+                        "co_changes": cf.co_change_count,
+                    }
+                    for cf in radius.coupled_files[:10]
+                ]
+                if radius.change_clusters:
+                    entry["clusters"] = [
+                        {"files": cl.files, "cohesion": round(cl.cohesion_score, 3)}
+                        for cl in radius.change_clusters
+                    ]
+
+            # Evolution narrative (auto-uses local model if available)
+            if include_narrative:
+                try:
+                    diff_analyzer = DiffSemanticAnalyzer(
+                        workspace_root, model_name=gc.narrative_model
+                    )
+                    narrative = diff_analyzer.summarize_evolution(hist)
+                    entry["narrative"] = narrative.narrative
+                    entry["phases"] = narrative.key_phases
+                    entry["model_used"] = narrative.model_used
+                except Exception:
+                    pass  # Graceful degradation
+
+            results[fp] = entry
+
+        return results
+
+    @mcp.tool()
+    def git_context(
+        workspace_root: str,
+        file_paths: list[str],
+        include_blast_radius: bool = True,
+        include_narrative: bool = True,
+    ) -> dict:
+        """Git-aware context for files: history, blast radius, evolution narrative.
+
+        Combines file history (revert-aware, cross-branch, recency-scored),
+        co-change blast radius, and model-generated evolution narrative.
+        Auto-uses local flan-t5 model for narrative when available.
+        """
+        result = _compute_git_context(
+            Path(workspace_root),
+            file_paths,
+            include_blast_radius=include_blast_radius,
+            include_narrative=include_narrative,
+        )
+        return _ok(scope="project", result=result)
 
     return mcp
 

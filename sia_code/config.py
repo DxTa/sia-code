@@ -73,6 +73,12 @@ class EmbeddingConfig(BaseModel):
     model: str = "BAAI/bge-base-en-v1.5"  # Model name (see supported models above)
     api_key_env: str = ""  # Deprecated legacy field; ignored by local-only runtime
     dimensions: int = 768  # Embedding dimensions (auto-detected for most models)
+    granularity: Literal["chunk", "budget"] = "chunk"
+    max_vectors_per_file: int = 0  # 0 = unlimited
+    semantic_chunk_types: list[str] = Field(
+        default_factory=lambda: ["class", "function", "method", "definition"]
+    )
+    persistent_cache: bool = True
 
 
 class IndexingConfig(BaseModel):
@@ -135,6 +141,7 @@ class SearchConfig(BaseModel):
     default_limit: int = 10
     multi_hop_enabled: bool = True
     max_hops: int = 2
+    flan_query_rewrite: bool = True  # cached-only FLAN extra rewrite candidate (on by default if model cached)
     vector_weight: float = (
         0.7  # Weight for vector search in hybrid (0.0=lexical only, 1.0=semantic only)
     )
@@ -183,6 +190,40 @@ class SummarizationConfig(BaseModel):
     max_commits: int = 20  # Max commits to include in summary
 
 
+class GitDynamicConfig(BaseModel):
+    """Configuration for dynamic git memory system."""
+
+    enabled: bool = True
+    lookback_commits: int = 200
+    coupling_threshold: float = 0.3
+    max_files_per_commit: int = 20  # squash dilution guard
+    working_window_days: int = 14
+    recency_halflife_days: float = 30.0
+    base_branch: str = "main"
+    cross_branch_enabled: bool = True
+    semantic_weight: float = 0.3  # in combined score: git=0.7, semantic=0.3
+    narrative_model: str | None = None  # None = auto-select (large on 16GB+, base otherwise)
+
+
+class RepoIndexOverride(BaseModel):
+    """Repo-specific indexing policy override for multi-repo workspaces."""
+
+    index_first: list[str] = Field(default_factory=list)
+    dependency_tier: list[str] = Field(default_factory=list)
+    lazy_index: list[str] = Field(default_factory=list)
+    skip: list[str] = Field(default_factory=list)
+
+
+class MultiRepoConfig(BaseModel):
+    """Workspace-level multi-repo indexing controls."""
+
+    enabled: bool = True
+    fanout_concurrency: int = 2
+    heavy_repo_chunk_threshold: int = 4000
+    heavy_repo_run_dependency_tier: bool = False
+    repo_overrides: dict[str, RepoIndexOverride] = Field(default_factory=dict)
+
+
 class StorageConfig(BaseModel):
     """Storage backend selection configuration."""
 
@@ -204,6 +245,8 @@ class Config(BaseModel):
     adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
     summarization: SummarizationConfig = Field(default_factory=SummarizationConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    git_dynamic: GitDynamicConfig = Field(default_factory=GitDynamicConfig)
+    multi_repo: MultiRepoConfig = Field(default_factory=MultiRepoConfig)
 
     @classmethod
     def load(cls, path: Path) -> "Config":
