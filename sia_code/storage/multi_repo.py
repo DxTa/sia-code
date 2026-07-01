@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re as _re
+from dataclasses import dataclass as _dataclass
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -393,3 +395,143 @@ def recommend_repo_timeout_seconds(file_count: int, estimated_chunks: int = 0) -
         return 300
     seconds = int(60 + file_count * 0.8)
     return max(300, min(1800, seconds))
+
+
+# ---------------------------------------------------------------------------
+# Repo-aware ranking helpers
+# ---------------------------------------------------------------------------
+
+
+# Words that strongly suggest a specific repo domain when found in a query
+_REPO_HINT_PATTERNS: dict[str, list[str]] = {
+    # annotation / CVAT-like repos
+    "annotation_platform": [
+        "annotation", "cvat", "task", "label", "labeling", "dataset",
+        "segmentation", "bounding box", "keypoint", "job", "organization",
+        "member", "project", "review", "webhook",
+    ],
+    # data science / trainer repos
+    "data_science": [
+        "stable diffusion", "diffusion", "trainer", "training", "lora",
+        "dreambooth", "flux", "controlnet", "vae", "unet", "sdxl",
+        "checkpoint", "finetune", "fine-tune", "fine_tune", "latent",
+        "dataset loader", "augment", "epoch",
+    ],
+    # general ml db / ingestion
+    "mldb": [
+        "mldb", "datasample", "ingestion", "pipeline", "metadata",
+        "ml platform", "gcputils",
+    ],
+}
+
+# Path patterns that indicate high-value first-party code (bonus)
+_FIRST_PARTY_PATTERNS = (
+    r"(apps|src|core|api|views|serializer|service|handler|trainer|pipeline|"
+    r"processor|model|router|schema|query|manager|controller)",
+)
+# Path patterns that indicate low-value content (penalty)
+_LOW_VALUE_PATTERNS = (
+    r"(test|spec|fixture|conftest|mock|__pycache__|node_modules|"
+    r"vendor|generated|dist|build|docs|site|migration|changelog|"
+    r"example|sample|assets|static|i18n)",
+)
+
+
+@_dataclass
+class RepoRankingContext:
+    """Per-query scoring state for repo-aware multi-repo ranking."""
+
+    cwd: Path
+    query: str
+    workspace_root: Path
+    registry: "MultiRepoRegistry | None"
+
+    # Computed once from query vocabulary
+    _profile_hints: dict[str, float] = None  # profile -> hint_score
+    _repo_name_scores: dict[str, float] = None  # repo_name -> name_score
+
+    # Compiled path patterns
+    _first_party_re: object = None
+    _low_value_re: object = None
+
+    def __post_init__(self) -> None:
+        q_lower = self.query.lower()
+        tokens = set(_re.findall(r"[a-z][a-z0-9]*", q_lower))
+
+        # Score each profile by how many hint terms appear in query
+        profile_hints: dict[str, float] = {}
+        for profile, hints in _REPO_HINT_PATTERNS.items():
+            score = 0.0
+            for hint in hints:
+                if hint in q_lower:
+                    score += 1.0
+            if score > 0:
+                profile_hints[profile] = min(score / 3.0, 1.0)
+        self._profile_hints = profile_hints
+
+        # Score repo names: boost repos whose name tokens appear in query
+        repo_name_scores: dict[str, float] = {}
+        if self.registry:
+            for entry in self.registry.repos:
+                name_tokens = set(_re.findall(r"[a-z][a-z0-9]*", entry.name.lower()))
+                overlap = name_tokens & tokens
+                if overlap:
+                    repo_name_scores[entry.name] = min(len(overlap) / 3.0, 1.0)
+        self._repo_name_scores = repo_name_scores
+
+        self._first_party_re = _re.compile(_FIRST_PARTY_PATTERNS[0], _re.IGNORECASE)
+        self._low_value_re = _re.compile(_LOW_VALUE_PATTERNS[0], _re.IGNORECASE)
+
+    def cwd_boost(self, repo_name: str) -> float:
+        """Return 1.0 if cwd is inside this repo, else 0.0."""
+        try:
+            repo_path = self.workspace_root / repo_name
+            self.cwd.relative_to(repo_path)
+            return 1.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    def repo_score(self, repo_name: str, profile: str) -> float:
+        """Composite repo-level score: cwd + name match + profile match."""
+        score = 0.0
+        score += self.cwd_boost(repo_name) * 0.60
+        score += self._repo_name_scores.get(repo_name, 0.0) * 0.25
+        score += self._profile_hints.get(profile, 0.0) * 0.15
+        return score
+
+    def path_adjustment(self, file_path: str) -> float:
+        """Return bonus (+) or penalty (-) based on file path quality."""
+        p = str(file_path).lower()
+        if self._low_value_re.search(p):
+            return -0.08
+        if self._first_party_re.search(p):
+            return +0.04
+        return 0.0
+
+    def adjusted_score(
+        self,
+        base_score: float,
+        repo_name: str,
+        profile: str,
+        file_path: str,
+    ) -> float:
+        """Final score = base + repo_boost + path_adjustment."""
+        repo_boost = self.repo_score(repo_name, profile)
+        path_adj = self.path_adjustment(file_path)
+        return base_score + repo_boost * 0.6 + path_adj
+
+
+def build_ranking_context(
+    workspace_root: Path,
+    query: str,
+    repo_profiles: "dict[str, str] | None" = None,
+) -> RepoRankingContext:
+    """Construct a ranking context from workspace root and query."""
+    registry = MultiRepoRegistry.load(get_registry_path(workspace_root))
+    cwd = Path.cwd()
+    return RepoRankingContext(
+        cwd=cwd,
+        query=query,
+        workspace_root=workspace_root,
+        registry=registry,
+    )

@@ -1192,8 +1192,22 @@ def search(
                 all_results.extend(rewritten)
             except Exception:
                 pass
-        # Sort by score descending, take top `limit`
-        results = sorted(all_results, key=lambda r: r.score, reverse=True)[:limit]
+        # Repo-aware re-ranking before slice
+        from .storage.multi_repo import build_ranking_context, get_repo_profile
+        _rctx = build_ranking_context(Path.cwd(), query)
+        reranked = []
+        for r in all_results:
+            _repo = str(r.chunk.metadata.get("_repo_name", ""))
+            if not _repo:
+                # infer from rewritten file_path first component
+                _repo = str(r.chunk.file_path).split("/")[0]
+            _profile = get_repo_profile(_repo)
+            _adj = _rctx.adjusted_score(
+                r.score, _repo, _profile, str(r.chunk.file_path)
+            )
+            reranked.append(replace(r, score=_adj))
+        # Sort by adjusted score descending, take top `limit`
+        results = sorted(reranked, key=lambda r: r.score, reverse=True)[:limit]
     else:
         results = _search_one_backend(backend)
 
@@ -1486,17 +1500,35 @@ def research(question: str, hops: int, graph: bool, limit: int, no_filter: bool)
     if multi_backends:
         from dataclasses import replace
         from pathlib import Path as _Path
+        from .storage.multi_repo import build_ranking_context, get_repo_profile
 
         combined_chunks = []
         combined_relationships = []
         max_hops_executed = 0
         total_entities_found = 0
+
+        # Build ranking context once for this question to score each repo
+        _rctx_pre = build_ranking_context(Path.cwd(), question)
+        _repo_scores = {
+            rname: _rctx_pre.repo_score(rname, get_repo_profile(rname))
+            for rname, _ in multi_backends
+        }
+        # Determine include threshold: take repos with top-N scores or score > 0
+        _sorted_scores = sorted(_repo_scores.values(), reverse=True)
+        _top_threshold = _sorted_scores[min(4, len(_sorted_scores) - 1)] if _sorted_scores else 0.0
+        # Always include repos with any non-zero score; fallback: include all if none score > 0
+        _any_positive = any(v > 0 for v in _repo_scores.values())
+
         with Progress(
             SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
         ) as progress:
             task = progress.add_task("Analyzing code relationships across repos...", total=None)
             for repo_name, backend in multi_backends:
                 try:
+                    repo_score = _repo_scores.get(repo_name, 0.0)
+                    # Skip repos with zero relevance if at least some repos are relevant
+                    if _any_positive and repo_score <= 0:
+                        continue
                     strategy = MultiHopSearchStrategy(backend, max_hops=hops)
                     repo_result = strategy.research(question, max_results_per_hop=limit)
                     if repo_result.chunks:
@@ -1520,9 +1552,22 @@ def research(question: str, hops: int, graph: bool, limit: int, no_filter: bool)
             progress.update(task, completed=True)
 
         from .search.multi_hop import ResearchResult
+        # Repo-aware re-ranking of combined research chunks
+        from .storage.multi_repo import build_ranking_context, get_repo_profile
+        _rctx = build_ranking_context(Path.cwd(), question)
+        reranked_chunks = []
+        _n = max(len(combined_chunks), 1)
+        for _i, chunk in enumerate(combined_chunks):
+            _repo = str(chunk.file_path).split("/")[0]
+            _profile = get_repo_profile(_repo)
+            _base = 1.0 - (_i / _n) * 0.5
+            _adj = _rctx.adjusted_score(_base, _repo, _profile, str(chunk.file_path))
+            reranked_chunks.append((_adj, chunk))
+        reranked_chunks.sort(key=lambda x: x[0], reverse=True)
+        sorted_chunks = [c for _, c in reranked_chunks]
         result = ResearchResult(
             question=question,
-            chunks=combined_chunks[: max(10, limit * 4)],
+            chunks=sorted_chunks[: max(10, limit * 4)],
             relationships=combined_relationships,
             hops_executed=max_hops_executed,
             total_entities_found=total_entities_found,
