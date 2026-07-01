@@ -23,7 +23,7 @@ from . import __version__
 from .config import Config
 from .indexer.coordinator import IndexingCoordinator
 
-console = Console()
+console = Console(force_terminal=True)
 
 
 def _display_skip_summary(
@@ -3070,60 +3070,60 @@ def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format)
         return
 
     # Table format
-        for fp, entry in all_results.items():
-            hist = entry["hist"]
-            console.print(f"\n[bold]{'='*60}[/bold]")
-            console.print(f"[bold]File:[/bold] {fp}")
-            if hist.branch_context:
-                ctx = hist.branch_context
-                console.print(
-                    f"  Branch: {ctx.current_branch} | Base: {ctx.base_branch}"
-                )
-            if hist.owners:
-                owners_str = ", ".join(f"{a} ({n})" for a, n in hist.owners[:3])
-                console.print(f"  Owners: {owners_str}")
-            if hist.reverts:
-                console.print(f"  [yellow]Reverts: {len(hist.reverts)}[/yellow]")
-                for r in hist.reverts:
-                    console.print(f"    {r.reverting_hash[:7]} reverts {r.reverted_hash[:7]}")
+    for fp, entry in all_results.items():
+        hist = entry["hist"]
+        console.print(f"\n[bold]{'='*60}[/bold]")
+        console.print(f"[bold]File:[/bold] {fp}")
+        if hist.branch_context:
+            ctx = hist.branch_context
+            console.print(
+                f"  Branch: {ctx.current_branch} | Base: {ctx.base_branch}"
+            )
+        if hist.owners:
+            owners_str = ", ".join(f"{a} ({n})" for a, n in hist.owners[:3])
+            console.print(f"  Owners: {owners_str}")
+        if hist.reverts:
+            console.print(f"  [yellow]Reverts: {len(hist.reverts)}[/yellow]")
+            for r in hist.reverts:
+                console.print(f"    {r.reverting_hash[:7]} reverts {r.reverted_hash[:7]}")
 
-            # Narrative
-            if entry["narrative"]:
-                n = entry["narrative"]
-                model_tag = f" [dim](via {n.model_used})[/dim]" if n.model_used else " [dim](heuristic)[/dim]"
-                console.print(f"\n  [bold]Evolution:[/bold]{model_tag}")
-                console.print(f"  {n.narrative}")
-                if n.key_phases:
-                    console.print(f"  Phases: {', '.join(n.key_phases)}")
+        # Narrative
+        if entry["narrative"]:
+            n = entry["narrative"]
+            model_tag = f" [dim](via {n.model_used})[/dim]" if n.model_used else " [dim](heuristic)[/dim]"
+            console.print(f"\n  [bold]Evolution:[/bold]{model_tag}")
+            console.print(f"  {n.narrative}")
+            if n.key_phases:
+                console.print(f"  Phases: {', '.join(n.key_phases)}")
 
-            # Commits
-            console.print(f"\n  [bold]History[/bold] ({len(hist.effective_commits)} effective):")
-            for c in hist.effective_commits[:8]:
-                intent_tag = f"[{c.intent}]" if c.intent else ""
-                console.print(
-                    f"    [{c.recency_score:.2f}] {c.hash[:7]} {c.message[:55]} "
-                    f"[dim]{c.author} {intent_tag}[/dim]"
-                )
+        # Commits
+        console.print(f"\n  [bold]History[/bold] ({len(hist.effective_commits)} effective):")
+        for c in hist.effective_commits[:8]:
+            intent_tag = f"[{c.intent}]" if c.intent else ""
+            console.print(
+                f"    [{c.recency_score:.2f}] {c.hash[:7]} {c.message[:55]} "
+                f"[dim]{c.author} {intent_tag}[/dim]"
+            )
 
-            # Blast radius
-            if entry["radius"] and entry["radius"].coupled_files:
-                radius = entry["radius"]
+        # Blast radius
+        if entry["radius"] and entry["radius"].coupled_files:
+            radius = entry["radius"]
+            console.print(
+                f"\n  [bold]Blast Radius[/bold] "
+                f"({radius.total_commits_analyzed} commits, "
+                f"{radius.commits_excluded_squash} squash-excluded):"
+            )
+            for cf in radius.coupled_files[:8]:
+                bar = "█" * int(cf.coupling_score * 20)
                 console.print(
-                    f"\n  [bold]Blast Radius[/bold] "
-                    f"({radius.total_commits_analyzed} commits, "
-                    f"{radius.commits_excluded_squash} squash-excluded):"
+                    f"    [{cf.coupling_score:.2f}] {bar:20s} {cf.path}"
                 )
-                for cf in radius.coupled_files[:8]:
-                    bar = "█" * int(cf.coupling_score * 20)
+            if radius.change_clusters:
+                for cl in radius.change_clusters:
                     console.print(
-                        f"    [{cf.coupling_score:.2f}] {bar:20s} {cf.path}"
+                        f"    [dim]Cluster (cohesion {cl.cohesion_score:.2f}): "
+                        f"{', '.join(cl.files)}[/dim]"
                     )
-                if radius.change_clusters:
-                    for cl in radius.change_clusters:
-                        console.print(
-                            f"    [dim]Cluster (cohesion {cl.cohesion_score:.2f}): "
-                            f"{', '.join(cl.files)}[/dim]"
-                        )
 
 
 if __name__ == "__main__":
