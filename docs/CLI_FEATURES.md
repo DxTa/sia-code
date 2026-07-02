@@ -9,6 +9,7 @@ sia-code init
 sia-code index .
 sia-code search --regex "auth|token"
 sia-code research "how does auth flow work?"
+sia-code memory trace "why did auth behavior change" --format table
 sia-code status
 ```
 
@@ -17,7 +18,7 @@ sia-code status
 | Command | Purpose | Key options |
 | --- | --- | --- |
 | `init` | Create `.sia-code/` index workspace | `--path`, `--dry-run` |
-| `index [PATH]` | Build index | `--update`, `--clean`, `--parallel`, `--workers`, `--watch`, `--debounce`, `--no-git-sync` |
+| `index [PATH]` | Build index (auto-fan-out for multi-repo workspaces) | `--update`, `--clean`, `--parallel`, `--workers`, `--watch`, `--debounce`, `--no-git-sync` |
 | `search QUERY` | Search code (default hybrid) | `--regex`, `--semantic-only`, `-k/--limit`, `--no-filter`, `--no-deps`, `--deps-only`, `--format`, `--output` |
 | `research QUESTION` | Multi-hop architecture exploration | `--hops`, `--graph`, `-k/--limit`, `--no-filter` |
 | `status` | Index health and statistics | none |
@@ -36,6 +37,7 @@ sia-code status
 | `memory search QUERY` | Search memory | `--type`, `-k/--limit` |
 | `memory working-set QUERY` | Build shared working-memory JSON for agent handoff | `--agent`, `--session-id`, `-o/--output` |
 | `memory trace QUERY` | Trace likely causal timeline events for a code query (graph + timeline overlap) | `--hops`, `--seed-limit`, `--timeline-limit`, `-k/--limit`, `--format` |
+| `memory git-context FILE...` | Show file history, reverts, owners, evolution narrative, and co-change blast radius | `--no-blast-radius`, `--no-narrative`, `--format` |
 | `memory timeline` | View timeline events | `--since`, `--event-type`, `--importance`, `--format` |
 | `memory changelog [RANGE]` | Generate changelog | `--format`, `--output` |
 | `memory export` / `memory import` | Backup/restore memory | `-o/--output`, `-i/--input` |
@@ -71,10 +73,12 @@ sia-code config set search.vector_weight 0.0
 ## Good Defaults
 
 - First index: `sia-code index .`
+- Parent folder with many repos: `sia-code index .` there too; search/research aggregate after indexing
 - Ongoing work: `sia-code index --update`
 - Exact symbols: `sia-code search --regex "pattern"`
 - Project-only focus: `--no-deps`
 - Architecture questions: `sia-code research "..." --hops 3`
+- Change understanding: `sia-code memory git-context path/to/file.py`
 
 ## Related Docs
 

@@ -1,6 +1,6 @@
 # Memory Features (Compact)
 
-Project memory helps preserve context beyond code search.
+Project memory helps preserve context beyond code search and makes recent code change history usable.
 
 ## Memory Types
 
@@ -24,6 +24,12 @@ sia-code memory approve 1 --category architecture
 # search memory later
 sia-code memory search "Adopt X" --type decision
 
+# ask why behavior changed
+sia-code memory trace "why did auth behavior change" --format table
+
+# inspect file history + blast radius
+sia-code memory git-context src/auth.py
+
 # build shared working memory for another agent step
 sia-code memory working-set "auth flow" --agent planner --session-id ses-123 -o shared-memory.json
 ```
@@ -38,6 +44,14 @@ sia-code memory working-set "auth flow" --agent planner --session-id ses-123 -o 
 - Duplicate events are skipped automatically
 
 This gives LLM agents structured context instead of raw git noise.
+
+## Change-understanding commands
+
+Use these when search finds code but you still need history and impact:
+
+- `memory trace` for likely causal timeline events behind a behavior or symbol change
+- `memory git-context <file>` for effective file history, likely owners, reverts, evolution narrative, and co-change blast radius
+- `memory working-set "query"` for stable agent handoff context
 
 ## Semantic changelog generation (local model)
 
@@ -68,6 +82,8 @@ Notes:
 | `memory add-decision` | create pending decision |
 | `memory approve` / `memory reject` | decision workflow |
 | `memory list` | list decisions/timeline/changelogs |
+| `memory trace` | trace likely causal timeline events for a query |
+| `memory git-context` | inspect file history, reverts, owners, narrative, and blast radius |
 | `memory working-set` | emit query-scoped shared working-memory JSON for agents, including approved decisions |
 | `memory timeline` | view timeline with filters |
 | `memory changelog` | render changelog text/json/markdown |
@@ -78,6 +94,7 @@ Notes:
 - Add decisions with explicit `description` and `reasoning`.
 - Run `memory sync-git` after major merges/tags.
 - Use memory search before repeating architecture work.
+- Use `memory git-context` before risky refactors to see likely blast radius.
 
 ## Troubleshooting
 

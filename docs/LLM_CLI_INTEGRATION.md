@@ -75,6 +75,7 @@ uvx sia-code init
 uvx sia-code index .
 uvx sia-code search --regex "your_symbol"
 uvx sia-code research "how does X work?"
+uvx sia-code memory trace "why did X change" --format table
 ```
 
 ## 5) Optional memory workflow
@@ -82,6 +83,8 @@ uvx sia-code research "how does X work?"
 ```bash
 uvx sia-code memory sync-git
 uvx sia-code memory search "topic"
+uvx sia-code memory trace "why did auth behavior change" --format table
+uvx sia-code memory git-context src/auth.py
 uvx sia-code memory add-decision "Decision title" -d "Context" -r "Reason"
 uvx sia-code memory working-set "auth flow" --agent planner --session-id ses-123 -o shared-memory.json
 ```
@@ -126,11 +129,22 @@ Recommendation:
 - Shared mode for many search/read sessions
 - Worktree mode when you want strict isolation per branch/agent
 - For shared mode, avoid many simultaneous index writers
+- If parent folder contains many git repos, run `sia-code init && sia-code index .` there; later `search`, `research`, and `status` aggregate across indexed sub-repos
+
+Minimal parent-workspace example:
+
+```bash
+cd /path/to/workspace-root
+sia-code init
+sia-code index .
+sia-code search "AuthService"
+```
 
 ## Notes
 
 - Prefer MCP when the client supports it; it removes the need to distribute prompt-side workflow files.
 - `engineering_bootstrap` is the intended portable first-call surface for engineering workflows when users only add `uvx sia-code-mcp` to their MCP config.
 - Keep the skill file short and practical for fallback environments.
+- `memory git-context` is currently CLI-first for file history + blast radius workflows.
 - Update this file when CLI behavior changes.
 - Keep both PyPI and local-checkout workflows documented during active development.

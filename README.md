@@ -2,210 +2,119 @@
 
 Local-first codebase intelligence for CLI workflows.
 
-Sia Code indexes your repo and lets you:
+Sia Code helps you:
 
-- search code fast (lexical, semantic, or hybrid)
-- trace architecture with multi-hop research
-- store/retrieve project decisions and timeline context
+- search and research code with lexical, semantic, or hybrid retrieval
+- run multi-hop architecture research across files, symbols, and repos
+- trace historical file and behavior changes (`memory trace`, `memory git-context`)
+- inspect blast radius before refactors
+- work across big repos, multi-repo workspaces, and git worktrees
 
-## Why teams use it
+## Why use it
 
-- Works directly on local code (`.sia-code/` index per repo/worktree)
-- Great for symbol-level search (`--regex`) and architecture questions (`research`)
-- Supports 12 AST-aware languages (Python, JS/TS, Go, Rust, Java, C/C++, C#, Ruby, PHP)
-- Integrates well with LLM CLI agents
+- Local index. No hosted service required.
+- Works well on big repos (think ~5,000 files, not only small projects).
+- Aggregates `search`, `research`, and `status` across multiple repos in one workspace.
+- Handles both architecture questions and history-aware change questions.
+- Good fit for MCP clients and skill-based CLI agents.
 
 ## Install
 
 ```bash
-# pip
-pip install sia-code
-
-# pip with MCP server support
-pip install "sia-code[mcp]"
-
-# or uv tool
-uv tool install sia-code
-
-# MCP entrypoint from PyPI/local checkout
+# MCP + CLI
 uv tool install "sia-code[mcp]"
 
-# verify
-sia-code --version
-sia-code-mcp --help
+# CLI only
+uv tool install sia-code
 ```
 
-## Quick Start (2 minutes)
+If you prefer pip, `pip install sia-code` and `pip install "sia-code[mcp]"` also work.
 
-```bash
-# in your project
-sia-code init
-sia-code index .
+## Quick start
 
-# search
-sia-code search --regex "auth|login|token"
+### 1) Skill first
 
-# architecture trace
-sia-code research "how does authentication work?"
-
-# index health
-sia-code status
-```
-
-## Command Cheatsheet
-
-| Command | What it does |
-| --- | --- |
-| `sia-code init` | Initialize `.sia-code/` in current project |
-| `sia-code index .` | Build index |
-| `sia-code index --update` | Incremental re-index |
-| `sia-code index --clean` | Rebuild index from scratch |
-| `sia-code search "query"` | Hybrid search (default) |
-| `sia-code search --regex "pattern"` | Lexical search |
-| `sia-code research "question"` | Multi-hop relationship discovery |
-| `sia-code memory sync-git` | Import timeline/changelog from git |
-| `sia-code memory search "topic"` | Search stored project memory |
-| `sia-code memory working-set "query"` | Build shared working-memory JSON for agents |
-| `sia-code memory trace "query"` | Trace likely causal timeline events for query |
-| `sia-code config show` | Print active configuration |
-
-## Search Modes (important)
-
-- Default command is hybrid: `sia-code search "query"`
-- Lexical mode: `sia-code search --regex "pattern"`
-- Semantic-only mode: `sia-code search --semantic-only "query"`
-
-Use `--no-deps` when you want only your project code.
-
-## Git Sync Memory + Semantic Changelog
-
-`sia-code memory sync-git` is the fastest way to build project memory from git history.
-
-- Scans tags into changelog entries
-- Scans merge commits into timeline events
-- Stores `files_changed` and diff stats (`insertions`, `deletions`, `files`)
-- Optionally enhances sparse summaries using a local summarization model
-
-How semantic summary generation works:
-
-1. `sync-git` collects git context (tags, merges, commit ranges, diff stats)
-2. It gathers commit subjects for each release/merge window
-3. A local model (default `google/flan-t5-base`) generates a concise summary sentence
-4. The enhanced summary is stored in memory and later exposed by `memory changelog`
-
-```bash
-sia-code memory sync-git
-sia-code memory working-set "auth flow" --agent planner --session-id ses-123
-sia-code memory trace "why did command parsing change" --format table
-sia-code memory add-decision "Keep sqlite-vec default" \
-  -d "Need a stable local-first backend baseline" \
-  -r "Consistent behavior across environments" \
-  --link-file sia_code/config.py \
-  --link-symbol default_backend \
-  --link-timeline "feature/sqlite-vec->main"
-sia-code memory changelog --format markdown
-```
-
-## LLM CLI Integration
-
-Primary integration is now the packaged MCP server:
-
-- `sia-code-mcp`
-
-For engineering workflows, the preferred first MCP call is:
-
-- `engineering_bootstrap`
-
-It bundles readiness checks, lightweight search, optional memory retrieval, and guarded multi-hop research so MCP-aware clients can use Sia Code effectively with only a bare MCP server configuration.
-
-Integration guide:
-
-- `docs/MCP_INTEGRATION.md`
-- `docs/LLM_CLI_INTEGRATION.md`
-
-Fallback skill file for environments without MCP support:
+Source skill file:
 
 - `skills/sia-code/SKILL.md`
 
-## Configuration
+Ask your agent to install from the file link.
 
-Config path:
-
-- `.sia-code/config.json`
-
-Useful commands:
+### 2) MCP
 
 ```bash
-sia-code config show
-sia-code config get search.vector_weight
-sia-code config set search.vector_weight 0.0
+uv tool install "sia-code[mcp]"
+sia-code-mcp
 ```
 
-Note: backend selection is auto by default (`sqlite-vec` for new indexes, legacy `usearch` supported).
+Simple JSON reference:
 
-## Multi-Worktree / Multi-Agent Setup
+```json
+{
+  "mcpServers": {
+    "sia-code": {
+      "command": "uvx",
+      "args": ["--from", "sia-code[mcp]", "sia-code-mcp"]
+    }
+  }
+}
+```
 
-Yes - Sia Code works with multiple git worktrees and multiple LLM CLI instances.
+Then point your MCP client at `sia-code-mcp`.
+See `docs/MCP_INTEGRATION.md` and `docs/LLM_CLI_INTEGRATION.md`.
 
-Scope resolution order:
-
-1. `SIA_CODE_INDEX_DIR` (explicit path override)
-2. `SIA_CODE_INDEX_SCOPE` (`shared`, `worktree`, or `auto`)
-3. `auto` fallback:
-   - linked worktree -> shared index at `<git-common-dir>/sia-code`
-   - normal checkout -> local `.sia-code`
+### 3) Direct CLI
 
 ```bash
-# Shared index across worktrees/agents
+# initialize + index
+uvx sia-code init
+uvx sia-code index .
+
+# lexical search for exact symbols
+uvx sia-code search --regex "AuthService|token"
+
+# hybrid / semantic-style research
+uvx sia-code research "how does authentication work?"
+
+# historical change research
+uvx sia-code memory trace "why did auth behavior change" --format table
+uvx sia-code memory git-context src/auth.py
+```
+
+## Big repos, multiple repos, worktrees
+
+- **Big repo:** built for real codebases with thousands of files, including ~5,000-file projects
+- **Multi-repo workspace:** run `index .` from parent folder; Sia Code auto-detects git sub-repos, indexes each, then aggregates `search`, `research`, and `status`
+- **Git worktrees / multi-agent sessions:** use shared or isolated indexes with `SIA_CODE_INDEX_SCOPE=shared|worktree`
+
+```bash
+# shared index across worktrees/agents
 export SIA_CODE_INDEX_SCOPE=shared
 
-# Isolated index per worktree
+# isolated index per worktree
 export SIA_CODE_INDEX_SCOPE=worktree
-
-# Full explicit control
-export SIA_CODE_INDEX_DIR=/absolute/path/to/sia-index
 ```
 
-Typical worktree workflow:
+## History-aware understanding
 
-```bash
-# in main checkout (build shared index once)
-export SIA_CODE_INDEX_SCOPE=shared
-sia-code init
-sia-code index .
+Use Sia Code for both code lookup and change understanding:
 
-# create feature worktree
-git worktree add ../feat-auth feat/auth
-cd ../feat-auth
+- `search` -> lexical, semantic, or hybrid retrieval
+- `research` -> multi-hop architecture tracing across related files and symbols
+- `memory sync-git` -> imports merges/tags as searchable timeline + changelog context
+- `memory trace` -> explains likely causal history for behavior or symbol changes
+- `memory git-context <file>` -> shows effective file history, likely owners, reverts, evolution narrative, and co-change blast radius
+- `memory working-set "query"` -> emits compact shared JSON context for agent handoff
 
-# reuse same shared index, then incrementally refresh
-sia-code status
-sia-code index --update
-```
+## More docs
 
-When a worktree is merged/removed:
-
-- `shared` scope: index stays in git common dir and remains usable
-- `worktree` scope: index lives in that worktree directory and is removed with it
-- after merge, run `sia-code index --update` in the remaining checkout
-
-Practical guidance:
-
-- Many readers/searchers are fine in shared mode
-- Prefer one active index writer per shared index
-- For strict branch/agent isolation, use `worktree`
-- Teams on different machines should keep local indexes and sync context via git + `sia-code memory sync-git`
-
-## Documentation
-
-- `docs/CLI_FEATURES.md` - concise CLI command reference
-- `docs/MCP_INTEGRATION.md` - MCP setup and transport notes
-- `docs/CODE_STRUCTURE.md` - repo/module map
-- `docs/ARCHITECTURE.md` - core runtime architecture
-- `docs/INDEXING.md` - indexing behavior and maintenance
-- `docs/QUERYING.md` - search modes and tuning
-- `docs/MEMORY_FEATURES.md` - memory workflow
-- `docs/BENCHMARK_RESULTS.md` - benchmark summary
+- `docs/CLI_FEATURES.md`
+- `docs/INDEXING.md`
+- `docs/QUERYING.md`
+- `docs/MEMORY_FEATURES.md`
+- `docs/MCP_INTEGRATION.md`
+- `docs/LLM_CLI_INTEGRATION.md`
+- `docs/ARCHITECTURE.md`
 
 ## License
 

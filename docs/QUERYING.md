@@ -1,5 +1,11 @@
 # Querying (Compact)
 
+Use Sia Code in this order:
+
+1. `search` when you know symbol, file, or pattern
+2. `research` when question spans multiple files
+3. `memory trace` / `memory git-context` when you need change history and blast radius
+
 ## Search Commands
 
 ```bash
@@ -16,27 +22,32 @@ sia-code search --semantic-only "handle login failures"
 ## Useful Flags
 
 - `-k, --limit <N>`: number of results
-- `--no-deps`: only project code
-- `--deps-only`: only dependency code
-- `--no-filter`: include stale chunks
-- `--format text|json|table|csv`
+- `--no-deps`: exclude dependency code
+- `--deps-only`: show only dependency matches
+- `--no-filter`: disable stale chunk filtering
+- `--format json|table|csv`: structured output
 - `--output <path>`: write results to file
 
 ## Multi-Hop Research
 
 ```bash
-sia-code research "how does auth middleware work?" --hops 3 --graph
+sia-code research "how does authentication work?" --hops 2
 ```
 
 Use this for architecture tracing, call-path discovery, and unfamiliar code.
 
-## Temporal Causal Trace
+## Change Understanding
 
 ```bash
+# likely causal history behind behavior change
 sia-code memory trace "why did auth behavior change" --format table
+
+# file history, reverts, owners, narrative, blast radius
+sia-code memory git-context src/auth.py
 ```
 
-Use this when you need timeline-aware clues (likely commits/merges) connected to query-relevant files and symbols.
+Use `memory trace` for query-level history.
+Use `memory git-context` for file-level history and impact.
 
 ## Shared Working Memory
 
@@ -44,60 +55,37 @@ Use this when you need timeline-aware clues (likely commits/merges) connected to
 sia-code memory working-set "auth flow" \
   --agent planner \
   --session-id ses-123 \
-  --output shared-working-memory.json
+  -o shared-memory.json
 ```
 
-Use this when multiple agents or long-running steps need the same query-scoped repo context in a stable JSON payload.
+Use this when multiple agents or long-running steps need same query-scoped repo context in stable JSON.
 
-## Conceptual Decision Links
+## Multi-Repo Querying
+
+If you indexed parent folder with multiple git sub-repos, `search` and `research` aggregate across them automatically.
 
 ```bash
-sia-code memory add-decision "Model auth rationale" \
-  -d "Capture intent and tradeoffs for auth flow changes" \
-  --link-file sia_code/cli.py \
-  --link-symbol memory_trace \
-  --link-timeline "feature/auth->main" \
-  --link-changelog v0.7.0
-
-sia-code memory list --type decision --status pending --format json
+sia-code index .
+sia-code search "AuthService"
+sia-code research "where is token refresh handled?"
 ```
-
-Use this to tie rationale/intent to concrete code and timeline artifacts, improving comprehension in later retrieval.
-
-## Comprehension Gap Benchmark
-
-```bash
-PATH="/home/dxta/dev/sia-code/.venv/bin:$PATH" \
-.venv/bin/python -m tests.benchmarks.run_academic_benchmarks \
-  --tool sia-code \
-  --dataset ground-truth-sia-code \
-  --k-values 5 \
-  --comprehension-report \
-  --output bechmarks/T1 \
-  --index-path .sia-code \
-  --codebase-path .
-```
-
-Use this when you want explicit lookup-vs-comprehension quality deltas in addition to Recall@5.
 
 ## Practical Tuning
 
 - `search.vector_weight = 0.0` => lexical-heavy behavior
 - `search.vector_weight = 1.0` => semantic-heavy behavior
-- defaults come from `.sia-code/config.json`
-
-```bash
-sia-code config get search.vector_weight
-sia-code config set search.vector_weight 0.0
-```
+- use `--no-deps` in large repos to cut noise
+- use `memory git-context` before risky refactors
 
 ## Output Tips
 
-- Use `--format json` for scripts/agents.
-- Use `--format table` for quick terminal scanning.
-- Use `--no-deps` in large repos to reduce noise.
+- Use `--format json` for scripts and agents
+- Use `--format table` for human review
+- Use `memory working-set` for handoff, not raw pasted logs
 
 ## Related Docs
 
 - `docs/CLI_FEATURES.md`
 - `docs/INDEXING.md`
+- `docs/MEMORY_FEATURES.md`
+- `docs/LLM_CLI_INTEGRATION.md`

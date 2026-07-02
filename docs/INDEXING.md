@@ -17,9 +17,20 @@ sia-code index .
 | Parallel | `sia-code index --parallel --workers 8` | Large repos |
 | Watch | `sia-code index --watch --debounce 2.0` | Continuous local development |
 
+## Multi-repo Workspaces
+
+If you run from parent folder that contains multiple git repos, Sia Code can auto-detect sub-repos, index each one under workspace `.sia-code/repos/<repo>`, then aggregate `search`, `research`, and `status` across them.
+
+```bash
+sia-code init
+sia-code index .
+```
+
+Use this for mono-workspaces made of separate repos.
+
 ## Worktrees and Multiple Agent Sessions
 
-Sia Code supports git worktrees and parallel LLM CLI sessions.
+Sia Code also supports git worktrees and parallel LLM CLI sessions.
 
 - Auto behavior in linked worktrees: shared index at `<git-common-dir>/sia-code`
 - Override behavior with env vars:
@@ -64,6 +75,7 @@ By default, indexing syncs git history into memory.
 - **Uninitialized repo**: run `sia-code init`
 - **Results feel old**: run `sia-code index --update`
 - **Major drift/corruption**: run `sia-code index --clean`
+- **Need repo isolation in shared workspace**: use `SIA_CODE_INDEX_SCOPE=worktree`
 
 ## Related Docs
 

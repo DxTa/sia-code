@@ -61,6 +61,7 @@ For engineering work in Claude Code, OpenCode, Codex, or any MCP-aware client, p
 
 Not exposed in v1:
 
+- `memory git-context` (CLI-only today for file history + blast radius)
 - interactive CLI mode
 - watch mode indexing
 - config editor launching
@@ -82,5 +83,11 @@ Defaults are optimized for MCP use:
 - large artifacts should be requested only when needed
 
 ## Fallback
+
+If your client does not support MCP yet, use CLI directly for history-heavy workflows such as:
+
+```bash
+sia-code memory git-context src/auth.py
+```
 
 If your client does not support MCP yet, use the fallback skill at `skills/sia-code/SKILL.md`.
