@@ -14,6 +14,7 @@ from rich.console import Console
 from .config import Config
 
 console = Console()
+err_console = Console(stderr=True)
 
 
 @dataclass(frozen=True)
@@ -46,11 +47,11 @@ def create_backend(
     )
     if is_implicit_sqlite_default_on_legacy_usearch:
         if not suppress_stdout_notices:
-            console.print(
+            err_console.print(
                 "[yellow]Detected legacy usearch index with implicit storage backend.[/yellow] "
                 "Using legacy backend for compatibility."
             )
-            console.print(
+            err_console.print(
                 "[dim]Set 'storage.backend=sqlite-vec' and run 'sia-code index --clean .' "
                 "to migrate when ready.[/dim]"
             )
@@ -74,10 +75,10 @@ def create_backend(
 
     if effective_backend == "auto" and detected_backend == "usearch":
         if not suppress_stdout_notices:
-            console.print(
+            err_console.print(
                 "[yellow]Detected legacy usearch index.[/yellow] Using it for compatibility."
             )
-            console.print(
+            err_console.print(
                 "[dim]Set 'storage.backend=usearch' to pin legacy mode, "
                 "or run 'sia-code index --clean .' to migrate to sqlite-vec.[/dim]"
             )
