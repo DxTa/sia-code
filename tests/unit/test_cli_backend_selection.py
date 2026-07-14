@@ -92,3 +92,31 @@ def test_working_set_command_requests_suppressed_notices(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert captured["suppress_stdout_notices"] is True
+
+
+def test_git_context_command_uses_resolved_index(monkeypatch, tmp_path):
+    resolved = False
+
+    def fake_require_initialized():
+        nonlocal resolved
+        resolved = True
+        return tmp_path / "custom-index", Config()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sia_code.cli.require_initialized", fake_require_initialized)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "memory",
+            "git-context",
+            "missing.py",
+            "--no-blast-radius",
+            "--no-narrative",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert resolved is True

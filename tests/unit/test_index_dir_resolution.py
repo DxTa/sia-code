@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from sia_code.cli import resolve_index_dir

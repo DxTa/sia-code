@@ -23,8 +23,12 @@ from . import __version__
 from .config import Config
 from .indexer.coordinator import IndexingCoordinator
 
-console = Console(force_terminal=True)
-err_console = Console(stderr=True, force_terminal=True)
+console = Console(
+    force_terminal=True, color_system="auto" if sys.stdout.isatty() else None
+)
+err_console = Console(
+    stderr=True, force_terminal=True, color_system="auto" if sys.stderr.isatty() else None
+)
 
 
 def _display_skip_summary(
@@ -2970,7 +2974,6 @@ def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format)
         sia-code memory git-context src/api.py src/crud.py --format json
         sia-code memory git-context src/api.py --no-narrative
     """
-    from .config import Config
     from .memory.blast_radius import BlastRadiusAnalyzer
     from .memory.diff_analyzer import DiffSemanticAnalyzer
     from .memory.git_dynamic import GitDynamicMemory
@@ -2978,7 +2981,7 @@ def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format)
     from .memory.recency import RecencyConfig
 
     project_dir = Path.cwd()
-    config = Config.load(project_dir / ".sia-code" / "config.json")
+    _, config = require_initialized()
     gc = config.git_dynamic
 
     recency_cfg = RecencyConfig(

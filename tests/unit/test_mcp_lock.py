@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from sia_code.mcp_lock import index_lock, lock_path_for_index
 
 

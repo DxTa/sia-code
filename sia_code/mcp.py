@@ -834,7 +834,7 @@ def build_server() -> FastMCP:
                 hit_files = list({m["file_path"] for m in search_hits["matches"] if "file_path" in m})[:3]
                 if hit_files:
                     git_context_payload = _compute_git_context(
-                        context.workspace_root, hit_files, limit=3
+                        context.workspace_root, config, hit_files, limit=3
                     )
         except Exception:
             pass  # Graceful — git context is supplementary
@@ -1109,8 +1109,11 @@ def build_server() -> FastMCP:
         try:
             if result.related_files:
                 dynamic_git = _compute_git_context(
-                    context.workspace_root, result.related_files[:3],
-                    limit=3, include_blast_radius=False,
+                    context.workspace_root,
+                    config,
+                    result.related_files[:3],
+                    limit=3,
+                    include_blast_radius=False,
                 )
         except Exception:
             pass
@@ -1284,23 +1287,19 @@ def build_server() -> FastMCP:
 
     def _compute_git_context(
         workspace_root: Path,
+        config: Config,
         file_paths: list[str],
         limit: int = 5,
         include_blast_radius: bool = True,
         include_narrative: bool = True,
     ) -> dict:
-        """Shared helper — computes git context for files.
-
-        Used by git_context tool, research, engineering_bootstrap, memory_trace.
-        """
-        from .config import Config
+        """Shared helper — computes git context for files."""
         from .memory.blast_radius import BlastRadiusAnalyzer
         from .memory.diff_analyzer import DiffSemanticAnalyzer
         from .memory.git_dynamic import GitDynamicMemory
         from .memory.intent_classifier import IntentClassifier
         from .memory.recency import RecencyConfig
 
-        config = Config.load(workspace_root / ".sia-code" / "config.json")
         gc = config.git_dynamic
 
         if not gc.enabled:
@@ -1401,6 +1400,7 @@ def build_server() -> FastMCP:
     def git_context(
         workspace_root: str,
         file_paths: list[str],
+        index_dir: str | None = None,
         include_blast_radius: bool = True,
         include_narrative: bool = True,
     ) -> dict:
@@ -1410,13 +1410,15 @@ def build_server() -> FastMCP:
         co-change blast radius, and model-generated evolution narrative.
         Auto-uses local flan-t5 model for narrative when available.
         """
+        context, config = _require_initialized_context(workspace_root, index_dir)
         result = _compute_git_context(
-            Path(workspace_root),
+            context.workspace_root,
+            config,
             file_paths,
             include_blast_radius=include_blast_radius,
             include_narrative=include_narrative,
         )
-        return _ok(scope="project", result=result)
+        return _ok(context=context, result=result)
 
     return mcp
 

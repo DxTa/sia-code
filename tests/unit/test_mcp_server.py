@@ -46,10 +46,62 @@ async def test_build_server_registers_expected_tool_names():
     server = build_server()
     tool_names = {tool.name for tool in await server.list_tools()}
 
-    assert {"init", "status", "search", "research"}.issubset(tool_names)
-    assert {"memory_working_set", "config_show", "embed_status"}.issubset(tool_names)
-    assert {"health_check", "engineering_bootstrap"}.issubset(tool_names)
-    assert "interactive" not in tool_names
+    assert tool_names == {
+        "compact",
+        "config_get",
+        "config_path",
+        "config_set",
+        "config_show",
+        "embed_start",
+        "embed_status",
+        "embed_stop",
+        "engineering_bootstrap",
+        "git_context",
+        "health_check",
+        "index",
+        "init",
+        "memory_add_decision",
+        "memory_approve",
+        "memory_changelog",
+        "memory_export",
+        "memory_import",
+        "memory_list",
+        "memory_reject",
+        "memory_search",
+        "memory_sync_git",
+        "memory_timeline",
+        "memory_trace",
+        "memory_working_set",
+        "research",
+        "search",
+        "status",
+    }
+
+
+@pytest.mark.anyio
+async def test_git_context_uses_explicit_index_dir(tmp_path):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    index_dir = tmp_path / "custom-index"
+    index_dir.mkdir()
+    Config().save(index_dir / "config.json")
+
+    server = build_server()
+    result = decode_tool_result(
+        await server.call_tool(
+            "git_context",
+            {
+                "workspace_root": str(workspace_root),
+                "index_dir": str(index_dir),
+                "file_paths": ["missing.py"],
+                "include_blast_radius": False,
+                "include_narrative": False,
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["resolved_index_dir"] == str(index_dir.resolve())
 
 
 @pytest.mark.anyio
