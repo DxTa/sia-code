@@ -3,7 +3,7 @@ name: sia-code
 description: Compact local-first code search skill for CLI agents using lexical, semantic, and hybrid retrieval, multi-hop research, history-aware memory, and agent handoff context.
 license: MIT
 compatibility: opencode
-version: 0.8.1
+version: 0.8.2
 ---
 
 # Sia-Code Skill (Compact)
