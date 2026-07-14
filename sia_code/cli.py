@@ -23,7 +23,12 @@ from . import __version__
 from .config import Config
 from .indexer.coordinator import IndexingCoordinator
 
-console = Console(force_terminal=True)
+console = Console(
+    force_terminal=True, color_system="auto" if sys.stdout.isatty() else None
+)
+err_console = Console(
+    stderr=True, force_terminal=True, color_system="auto" if sys.stderr.isatty() else None
+)
 
 
 def _display_skip_summary(
@@ -139,11 +144,11 @@ def create_backend(
     )
     if is_implicit_sqlite_default_on_legacy_usearch:
         if not suppress_stdout_notices:
-            console.print(
+            err_console.print(
                 "[yellow]Detected legacy usearch index with implicit storage backend.[/yellow] "
                 "Using legacy backend for compatibility."
             )
-            console.print(
+            err_console.print(
                 "[dim]Set 'storage.backend=sqlite-vec' and run 'sia-code index --clean .' "
                 "to migrate when ready.[/dim]"
             )
@@ -167,10 +172,10 @@ def create_backend(
 
     if effective_backend == "auto" and detected_backend == "usearch":
         if not suppress_stdout_notices:
-            console.print(
+            err_console.print(
                 "[yellow]Detected legacy usearch index.[/yellow] Using it for compatibility."
             )
-            console.print(
+            err_console.print(
                 "[dim]Set 'storage.backend=usearch' to pin legacy mode, "
                 "or run 'sia-code index --clean .' to migrate to sqlite-vec.[/dim]"
             )
@@ -2969,7 +2974,6 @@ def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format)
         sia-code memory git-context src/api.py src/crud.py --format json
         sia-code memory git-context src/api.py --no-narrative
     """
-    from .config import Config
     from .memory.blast_radius import BlastRadiusAnalyzer
     from .memory.diff_analyzer import DiffSemanticAnalyzer
     from .memory.git_dynamic import GitDynamicMemory
@@ -2977,7 +2981,7 @@ def memory_git_context(file_paths, no_blast_radius, no_narrative, output_format)
     from .memory.recency import RecencyConfig
 
     project_dir = Path.cwd()
-    config = Config.load(project_dir / ".sia-code" / "config.json")
+    _, config = require_initialized()
     gc = config.git_dynamic
 
     recency_cfg = RecencyConfig(

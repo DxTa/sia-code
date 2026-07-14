@@ -67,7 +67,7 @@ uvx sia-code memory working-set "auth flow" \
 ```
 
 - `memory working-set` emits stable JSON for agent handoff.
-- `memory git-context` is CLI-only and useful before risky refactors.
+- `memory git-context` is useful before risky refactors; MCP clients use `git_context`.
 
 ## Multi-Repo and Worktrees
 

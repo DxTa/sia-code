@@ -145,6 +145,6 @@ sia-code search "AuthService"
 - Prefer MCP when the client supports it; it removes the need to distribute prompt-side workflow files.
 - `engineering_bootstrap` is the intended portable first-call surface for engineering workflows when users only add `uvx sia-code-mcp` to their MCP config.
 - Keep the skill file short and practical for fallback environments.
-- `memory git-context` is currently CLI-first for file history + blast radius workflows.
+- Use `memory git-context` in CLI workflows or `git_context` through MCP.
 - Update this file when CLI behavior changes.
 - Keep both PyPI and local-checkout workflows documented during active development.

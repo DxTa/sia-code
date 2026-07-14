@@ -12,7 +12,6 @@ from pathlib import Path
 from sia_code.memory.git_dynamic import GitDynamicMemory
 from sia_code.memory.blast_radius import BlastRadiusAnalyzer
 from sia_code.memory.recency import RecencyConfig, RecencyScorer
-from sia_code.memory.revert_detector import RevertDetector, CommitInfo
 from sia_code.memory.intent_classifier import IntentClassifier
 
 
@@ -145,7 +144,6 @@ class TestRecencyScorer:
 
     def test_halflife_gives_half_weight(self):
         from datetime import datetime, timedelta, timezone
-        import math
 
         scorer = RecencyScorer(RecencyConfig(halflife_days=30, working_window_days=14))
         now = datetime.now(timezone.utc)

@@ -48,6 +48,7 @@ Exposed in v1:
 - `memory_export`, `memory_import`
 - `config_show`, `config_path`, `config_get`, `config_set`
 - `embed_start`, `embed_status`, `embed_stop`
+- `git_context`
 
 ## Recommended First Call
 
@@ -61,7 +62,6 @@ For engineering work in Claude Code, OpenCode, Codex, or any MCP-aware client, p
 
 Not exposed in v1:
 
-- `memory git-context` (CLI-only today for file history + blast radius)
 - interactive CLI mode
 - watch mode indexing
 - config editor launching

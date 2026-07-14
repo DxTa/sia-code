@@ -36,7 +36,16 @@ def test_open_index_writable_uses_load(monkeypatch, tmp_path):
         def ndim(self):
             return 768
 
-    monkeypatch.setattr(usearch_backend, "Index", FakeIndex)
+    class FakeMetricKind:
+        Cos = "cos"
+        L2sq = "l2sq"
+
+    monkeypatch.setattr(
+        usearch_backend, "_lazy_usearch", lambda: (FakeIndex, FakeMetricKind)
+    )
+    monkeypatch.setattr(
+        usearch_backend.UsearchSqliteBackend, "_get_embedder", lambda self: None
+    )
 
     backend = usearch_backend.UsearchSqliteBackend(path=tmp_path)
     backend.open_index(writable=True)

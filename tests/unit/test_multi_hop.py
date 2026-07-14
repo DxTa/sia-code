@@ -506,12 +506,11 @@ class TestAdaptiveSearch:
         backend.embedding_enabled = True
         backend.embedding_granularity = "budget"
 
-        original_search_hybrid = backend.search_hybrid
         calls = []
 
         def mock_search_hybrid(query, *args, **kwargs):
             calls.append(query)
-            return original_search_hybrid(query, *args, **kwargs)
+            return []
 
         backend.search_hybrid = mock_search_hybrid
 
