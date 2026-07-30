@@ -35,6 +35,7 @@ from .runtime_context import (
     resolve_workspace_context,
 )
 from .search.multi_hop import MultiHopSearchStrategy
+from . import query_cache
 
 
 ENGINEERING_RESEARCH_HINTS = (
@@ -286,6 +287,40 @@ def _chunk_index_valid_chunks(context: WorkspaceContext, no_filter: bool) -> set
         return None
 
 
+def _cap_list(payload: dict[str, Any], key: str, max_items: int) -> tuple[dict[str, Any], int]:
+    """Drop trailing items from payload[key] list; return (payload, dropped_count)."""
+    items = payload.get(key)
+    if not isinstance(items, list) or max_items <= 0 or len(items) <= max_items:
+        return payload, 0
+    dropped = len(items) - max_items
+    payload[key] = items[:max_items]
+    payload["truncated"] = True
+    payload["dropped"] = payload.get("dropped", 0) + dropped
+    return payload, dropped
+
+
+def _truncate_to_bytes(payload: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    """If serialized payload exceeds max_bytes, shrink `matches`/`chunks` until it fits."""
+    if max_bytes <= 0:
+        return payload
+    for _ in range(8):
+        blob = json.dumps(payload, separators=(",", ":"))
+        if len(blob.encode("utf-8")) <= max_bytes:
+            return payload
+        shrunk = False
+        for key in ("matches", "chunks"):
+            items = payload.get(key)
+            if isinstance(items, list) and len(items) > 1:
+                items.pop()
+                payload["truncated"] = True
+                payload["dropped"] = payload.get("dropped", 0) + 1
+                shrunk = True
+                break
+        if not shrunk:
+            break
+    return payload
+
+
 def _serialize_chunk(chunk, detail: str = "minimal") -> dict[str, Any]:
     payload = {
         "id": chunk.id,
@@ -298,7 +333,7 @@ def _serialize_chunk(chunk, detail: str = "minimal") -> dict[str, Any]:
     }
     if detail in {"normal", "debug"}:
         payload["metadata"] = chunk.metadata
-        payload["preview"] = chunk.code[:200]
+        payload["preview"] = chunk.code[:160]
     if detail == "debug":
         payload["code"] = chunk.code
     return payload
@@ -310,7 +345,7 @@ def _serialize_result(result, detail: str = "minimal") -> dict[str, Any]:
         "chunk": _serialize_chunk(result.chunk, detail=detail),
     }
     snippet = result.snippet or result.chunk.code[:120]
-    payload["snippet"] = snippet[:120]
+    payload["snippet"] = snippet[:96]
     return payload
 
 
@@ -576,9 +611,30 @@ def build_server() -> FastMCP:
                 "warning": "Search skipped because the workspace is not indexed.",
                 },
             )
+        limit = max(1, min(limit, config.search.max_matches))
         valid_chunks = _chunk_index_valid_chunks(context, no_filter)
         include_deps = not no_deps
         tier_boost = config.search.tier_boost if hasattr(config.search, "tier_boost") else None
+
+        stats_payload = None
+        with _backend_session(context, config, suppress_stdout_notices=True) as backend:
+            stats_payload = _serialize_stats(backend.get_stats())
+
+        if config.search.query_cache_enabled:
+            cached = query_cache.get(
+                context.index_dir,
+                workspace_root=str(context.workspace_root),
+                tool="search",
+                query=query,
+                mode=mode,
+                k=limit,
+                detail=detail,
+                stats_payload=stats_payload,
+                ttl_seconds=config.search.query_cache_ttl_seconds,
+                extra=f"{no_deps}|{deps_only}|{include_deps}",
+            )
+            if cached is not None:
+                return cached
 
         with _backend_session(context, config, valid_chunks=valid_chunks) as backend:
             if mode in {"regex", "lexical"}:
@@ -604,27 +660,41 @@ def build_server() -> FastMCP:
         if deps_only:
             results = [r for r in results if r.chunk.metadata.get("tier") == "dependency"]
 
-        stats_payload = None
-        with _backend_session(context, config, suppress_stdout_notices=True) as backend:
-            stats_payload = _serialize_stats(backend.get_stats())
         freshness = _freshness_payload(context, stats_payload)
         warning = None
         if not results and freshness.get("stale"):
             warning = "No matches found, but the index appears stale. Run index --update before trusting this result."
 
-        return _ok(
+        result_body = {
+            "query": query,
+            "mode": resolved_mode,
+            "match_count": len(results),
+            "matches": [_serialize_result(result, detail=detail) for result in results],
+            "freshness": freshness,
+            "warning": warning,
+        }
+        _cap_list(result_body, "matches", config.search.max_matches)
+        _truncate_to_bytes(result_body, config.search.max_result_bytes)
+        payload = _ok(
             context=context,
-            result={
-                "query": query,
-                "mode": resolved_mode,
-                "match_count": len(results),
-                "matches": [_serialize_result(result, detail=detail) for result in results],
-                "freshness": freshness,
-                "warning": warning,
-            },
+            result=result_body,
             backend=config.storage.backend,
             embedding_runtime=_embedding_runtime(config),
         )
+        if config.search.query_cache_enabled:
+            query_cache.put(
+                context.index_dir,
+                workspace_root=str(context.workspace_root),
+                tool="search",
+                query=query,
+                mode=mode,
+                k=limit,
+                detail=detail,
+                stats_payload=stats_payload,
+                payload=payload,
+                extra=f"{no_deps}|{deps_only}|{include_deps}",
+            )
+        return payload
 
     @mcp.tool()
     def research(
@@ -648,25 +718,67 @@ def build_server() -> FastMCP:
         context, config = _require_initialized_context(workspace_root, index_dir)
         valid_chunks = _chunk_index_valid_chunks(context, no_filter)
         augmented_question = _augment_query(question, objective, current_focus, constraints)
+        limit = max(1, min(limit, config.search.max_matches))
+
+        with _backend_session(context, config, suppress_stdout_notices=True) as backend:
+            stats_payload = _serialize_stats(backend.get_stats())
+
+        cache_extra = f"{hops}|{graph}|{objective}|{current_focus}|{constraints}"
+        if config.search.query_cache_enabled:
+            cached = query_cache.get(
+                context.index_dir,
+                workspace_root=str(context.workspace_root),
+                tool="research",
+                query=question,
+                mode=str(hops),
+                k=limit,
+                detail=detail,
+                stats_payload=stats_payload,
+                ttl_seconds=config.search.query_cache_ttl_seconds,
+                extra=cache_extra,
+            )
+            if cached is not None:
+                return cached
 
         with _backend_session(context, config, valid_chunks=valid_chunks) as backend:
             strategy = MultiHopSearchStrategy(backend, max_hops=hops)
             result = strategy.research(augmented_question, max_results_per_hop=limit)
             call_graph = strategy.build_call_graph(result.relationships) if graph else None
 
-        return _ok(
+        result_body = {
+            "question": question,
+            "chunks": [_serialize_chunk(chunk, detail=detail) for chunk in result.chunks],
+            "relationships": [rel.__dict__ for rel in result.relationships],
+            "call_graph": call_graph,
+            "hops_executed": result.hops_executed,
+            "total_entities_found": result.total_entities_found,
+        }
+        _cap_list(result_body, "chunks", config.search.max_matches)
+        _cap_list(result_body, "relationships", config.search.max_relationships)
+        if isinstance(result_body.get("call_graph"), dict):
+            for gkey in ("nodes", "edges"):
+                _cap_list(result_body["call_graph"], gkey, config.search.max_relationships * 2)
+        _truncate_to_bytes(result_body, config.search.max_result_bytes)
+        payload = _ok(
             context=context,
-            result={
-                "question": question,
-                "chunks": [_serialize_chunk(chunk, detail=detail) for chunk in result.chunks],
-                "relationships": [rel.__dict__ for rel in result.relationships],
-                "call_graph": call_graph,
-                "hops_executed": result.hops_executed,
-                "total_entities_found": result.total_entities_found,
-            },
+            result=result_body,
             backend=config.storage.backend,
             embedding_runtime=_embedding_runtime(config),
         )
+        if config.search.query_cache_enabled:
+            query_cache.put(
+                context.index_dir,
+                workspace_root=str(context.workspace_root),
+                tool="research",
+                query=question,
+                mode=str(hops),
+                k=limit,
+                detail=detail,
+                stats_payload=stats_payload,
+                payload=payload,
+                extra=cache_extra,
+            )
+        return payload
 
     @mcp.tool()
     def engineering_bootstrap(
@@ -1131,7 +1243,7 @@ def build_server() -> FastMCP:
     ) -> dict[str, Any]:
         context, config = _require_initialized_context(workspace_root, index_dir)
         with _backend_session(context, config) as backend:
-            events = backend.get_timeline_events(limit=100)
+            events = backend.get_timeline_events(limit=50)
         if event_type:
             events = [item for item in events if item.event_type == event_type]
         if importance:
@@ -1139,7 +1251,10 @@ def build_server() -> FastMCP:
         if since:
             since_date = datetime.fromisoformat(since)
             events = [item for item in events if item.created_at and item.created_at >= since_date]
-        return _ok(context=context, result={"events": [event.to_dict() for event in events]})
+        result_body = {"events": [event.to_dict() for event in events]}
+        _cap_list(result_body, "events", 50)
+        _truncate_to_bytes(result_body, config.search.max_result_bytes)
+        return _ok(context=context, result=result_body)
 
     @mcp.tool()
     def memory_changelog(
@@ -1150,7 +1265,7 @@ def build_server() -> FastMCP:
     ) -> dict[str, Any]:
         context, config = _require_initialized_context(workspace_root, index_dir)
         with _backend_session(context, config) as backend:
-            changelogs = backend.get_changelogs(limit=100)
+            changelogs = backend.get_changelogs(limit=50)
         if range_spec and ".." in range_spec:
             start, end = range_spec.split("..", 1)
             changelogs = [item for item in changelogs if start <= (item.tag or "") <= end]

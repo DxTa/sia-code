@@ -154,6 +154,14 @@ class SearchConfig(BaseModel):
         }
     )
     include_dependencies: bool = True  # Default: deps always included in search
+    # ponytail: payload size caps to keep MCP results small for LLM context.
+    # Upgrade path: raise per-workspace if a caller needs fuller dumps.
+    max_result_bytes: int = 4096
+    max_relationships: int = 20
+    max_matches: int = 20
+    # Disk-backed query->result cache (invalidated by index signature + TTL).
+    query_cache_enabled: bool = True
+    query_cache_ttl_seconds: int = 3600
 
 
 class DependencyConfig(BaseModel):
